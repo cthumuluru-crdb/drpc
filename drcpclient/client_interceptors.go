@@ -1,25 +1,26 @@
-package drpcinterceptors
+package drcpclient
 
 import (
 	"context"
+
 	"storj.io/drpc"
 )
 
-type UnaryClientInterceptor func(ctx context.Context, rpc string, in, out drpc.Message, cc drpc.Conn, enc drpc.Encoding, next UnaryInvoker) error
+type UnaryClientInterceptor func(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message, cc drpc.Conn, next UnaryInvoker) error
 
-type UnaryInvoker func(ctx context.Context, rpc string, in, out drpc.Message, enc drpc.Encoding) error
+type UnaryInvoker func(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) error
 
 // Streamer is a function that opens a new DRPC stream.
-type Streamer func(ctx context.Context, method string) (drpc.Stream, error)
+type Streamer func(ctx context.Context, rpc string, enc drpc.Encoding) (drpc.Stream, error)
 
 // StreamClientInterceptor is the DRPC equivalent of a gRPC stream client interceptor.
-type StreamClientInterceptor func(ctx context.Context, method string, conn drpc.Conn, streamer Streamer) (drpc.Stream, error)
+type StreamClientInterceptor func(ctx context.Context, rpc string, enc drpc.Encoding, conn drpc.Conn, streamer Streamer) (drpc.Stream, error)
 
 type DialOptions struct {
-	UnaryInt   UnaryClientInterceptor
-	unaryInts  []UnaryClientInterceptor
-	StreamInt  StreamClientInterceptor
-	streamInts []StreamClientInterceptor
+	chainedUnaryInt  UnaryClientInterceptor
+	unaryInts        []UnaryClientInterceptor
+	chainedStreamInt StreamClientInterceptor
+	streamInts       []StreamClientInterceptor
 }
 type DialOption func(options *DialOptions)
 
@@ -35,15 +36,18 @@ func WithChainStreamInterceptor(ints ...StreamClientInterceptor) DialOption {
 	}
 }
 
-func NewDialOptions(opts []DialOption) *DialOptions {
+func newDialOptions(opts []DialOption) *DialOptions {
 	options := &DialOptions{}
 	for _, opt := range opts {
 		opt(options)
 	}
+	options.chainUnaryClientInterceptors()
+	options.chainStreamClientInterceptors()
+
 	return options
 }
 
-// ChainUnaryClientInterceptors chains all unary client interceptors in the DialOptions into a single interceptor.
+// chainUnaryClientInterceptors chains all unary client interceptors in the DialOptions into a single interceptor.
 //
 // This method inspects the slice of unary client interceptors (`d.unaryInts`) and combines them into one interceptor,
 // assigning the result to `d.UnaryInt`. If there are no interceptors, `d.UnaryInt` is set to nil. If there is only one,
@@ -62,28 +66,25 @@ func NewDialOptions(opts []DialOption) *DialOptions {
 //
 // Side effects:
 //   - Sets d.UnaryInt to the chained interceptor or nil.
-func (d *DialOptions) ChainUnaryClientInterceptors() {
-	switch n := len(d.unaryInts); n {
-	case 0:
-		d.UnaryInt = nil
-	case 1:
-		d.UnaryInt = d.unaryInts[0]
-	default:
-		d.UnaryInt = func(ctx context.Context, method string, in, out drpc.Message, conn drpc.Conn, enc drpc.Encoding, invoker UnaryInvoker) error {
-			chained := invoker
-			for i := n - 1; i >= 0; i-- {
-				next := chained
-				interceptor := d.unaryInts[i]
-				chained = func(ctx context.Context, method string, in, out drpc.Message, enc drpc.Encoding) error {
-					return interceptor(ctx, method, in, out, conn, enc, next)
-				}
+func (d *DialOptions) chainUnaryClientInterceptors() {
+	// NB: gRPC appears to treat unary interceptor special (WithUnaryInterceptor).
+	// Either we have to design out interceptors similarly or change gRPC consumers to use chained interceptors.
+	// (chandrat) I prefer the former.
+	n := len(d.unaryInts)
+	d.chainedUnaryInt = func(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message, conn drpc.Conn, invoker UnaryInvoker) error {
+		chained := invoker
+		for i := n - 1; i >= 0; i-- {
+			next := chained
+			interceptor := d.unaryInts[i]
+			chained = func(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) error {
+				return interceptor(ctx, rpc, enc, in, out, conn, next)
 			}
-			return chained(ctx, method, in, out, enc)
 		}
+		return chained(ctx, rpc, enc, in, out)
 	}
 }
 
-// ChainStreamClientInterceptors chains all stream client interceptors in the DialOptions into a single interceptor.
+// chainStreamClientInterceptors chains all stream client interceptors in the DialOptions into a single interceptor.
 //
 // This method examines the slice of stream client interceptors (`d.streamInts`) and combines them into one interceptor,
 // assigning the result to `d.StreamInt`. If there are no interceptors, `d.StreamInt` is set to nil. If there is only one,
@@ -97,29 +98,22 @@ func (d *DialOptions) ChainUnaryClientInterceptors() {
 //	opts := drpcinterceptors.NewDialOptions([]drpcinterceptors.DialOption{
 //		drpcinterceptors.WithChainStreamInterceptor(loggingInterceptor, metricsInterceptor),
 //	})
-//	opts.ChainStreamClientInterceptors()
+//	opts.chainStreamClientInterceptors()
 //	// opts.StreamInt now contains the chained stream interceptor.
 //
 // Side effects:
 //   - Sets d.StreamInt to the chained interceptor or nil.
-func (d *DialOptions) ChainStreamClientInterceptors() {
-	n := len(d.streamInts)
-	switch n {
-	case 0:
-		d.StreamInt = nil
-	case 1:
-		d.StreamInt = d.streamInts[0]
-	default:
-		d.StreamInt = func(ctx context.Context, method string, conn drpc.Conn, streamer Streamer) (drpc.Stream, error) {
-			chained := streamer
-			for i := n - 1; i >= 0; i-- {
-				next := chained
-				interceptor := d.streamInts[i]
-				chained = func(ctx context.Context, method string) (drpc.Stream, error) {
-					return interceptor(ctx, method, conn, next)
-				}
+func (d *DialOptions) chainStreamClientInterceptors() {
+	n := len(d.unaryInts)
+	d.chainedStreamInt = func(ctx context.Context, rpc string, enc drpc.Encoding, conn drpc.Conn, streamer Streamer) (drpc.Stream, error) {
+		chained := streamer
+		for i := n - 1; i >= 0; i-- {
+			next := chained
+			interceptor := d.streamInts[i]
+			chained = func(ctx context.Context, rpc string, enc drpc.Encoding) (drpc.Stream, error) {
+				return interceptor(ctx, rpc, enc, conn, next)
 			}
-			return chained(ctx, method)
 		}
+		return chained(ctx, rpc, enc)
 	}
 }

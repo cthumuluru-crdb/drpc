@@ -1,18 +1,18 @@
-package drcpclientconn
+package drcpclient
 
 import (
 	"context"
+	"net"
+	"testing"
+	"time"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"net"
 	"storj.io/drpc"
 	"storj.io/drpc/drpcconn"
-	"storj.io/drpc/drpcinterceptors"
 	"storj.io/drpc/drpcpool"
 	"storj.io/drpc/drpctest"
 	"storj.io/drpc/drpcwire"
-	"testing"
-	"time"
 )
 
 // Dummy encoding, which assumes the drpc.Message is a *string.
@@ -39,13 +39,13 @@ func TestUnaryInterceptorChainWithPooledAndConcreteDrpcConn(t *testing.T) {
 	// Test cases for different connection supplier implementations
 	testCases := []struct {
 		name           string
-		createSupplier func(context.Context, net.Conn) func() (drpc.Conn, error)
+		createSupplier func(context.Context, net.Conn) func(context.Context) (drpc.Conn, error)
 	}{
 		{
 			name: "drpcconn.Conn supplier",
 			// Basic connection supplier that returns a concrete connection directly
-			createSupplier: func(ctx context.Context, pc net.Conn) func() (drpc.Conn, error) {
-				return func() (drpc.Conn, error) {
+			createSupplier: func(ctx context.Context, pc net.Conn) func(ctx context.Context) (drpc.Conn, error) {
+				return func(_ context.Context) (drpc.Conn, error) {
 					return drpcconn.New(pc), nil
 				}
 			},
@@ -53,16 +53,17 @@ func TestUnaryInterceptorChainWithPooledAndConcreteDrpcConn(t *testing.T) {
 		{
 			name: "drpcpool.Conn supplier",
 			// Pool-based connection supplier that returns connections from a connection pool
-			createSupplier: func(ctx context.Context, pc net.Conn) func() (drpc.Conn, error) {
+			createSupplier: func(ctx context.Context, pc net.Conn) func(ctx context.Context) (drpc.Conn, error) {
 				pool := drpcpool.New[string, drpcpool.Conn](drpcpool.Options{
 					Capacity:    2,
 					KeyCapacity: 1,
 					Expiration:  time.Minute,
 				})
 				t.Cleanup(func() {
-					pool.Close()
+					err := pool.Close()
+					require.NoError(t, err)
 				})
-				return func() (drpc.Conn, error) {
+				return func(ctx context.Context) (drpc.Conn, error) {
 					// Get a connection from the pool using a test server address
 					return pool.Get(ctx, "test.server:8080", func(ctx context.Context, addr string) (drpcpool.Conn, error) {
 						return drpcconn.New(pc), nil
@@ -75,35 +76,43 @@ func TestUnaryInterceptorChainWithPooledAndConcreteDrpcConn(t *testing.T) {
 	for _, tc := range testCases {
 		ctx := drpctest.NewTracker(t)
 		pc, ps := net.Pipe() // client and server side of pipe respectively
-		defer pc.Close()
-		defer ps.Close()
+		defer func() {
+			err := pc.Close()
+			require.NoError(t, err)
+		}()
 
-		supplier := tc.createSupplier(ctx, pc)
+		defer func() {
+			err := ps.Close()
+			require.NoError(t, err)
+		}()
 
-		var interceptorCalls []string
+		dialer := tc.createSupplier(ctx, pc)
 
-		interceptor1 := func(ctx context.Context, method string, in, out drpc.Message,
-			conn drpc.Conn, enc drpc.Encoding, invoker drpcinterceptors.UnaryInvoker) error {
+		var interceptorCalls []string = []string{}
+
+		interceptor1 := func(ctx context.Context, method string, enc drpc.Encoding, in, out drpc.Message,
+			conn drpc.Conn, invoker UnaryInvoker) error {
 			interceptorCalls = append(interceptorCalls, "interceptor1_before")
-			err := invoker(ctx, method, in, out, enc)
+			err := invoker(ctx, method, enc, in, out)
 			interceptorCalls = append(interceptorCalls, "interceptor1_after")
 			return err
 		}
 
-		interceptor2 := func(ctx context.Context, method string, in, out drpc.Message,
-			conn drpc.Conn, enc drpc.Encoding, invoker drpcinterceptors.UnaryInvoker) error {
+		interceptor2 := func(ctx context.Context, method string, enc drpc.Encoding, in, out drpc.Message,
+			conn drpc.Conn, invoker UnaryInvoker) error {
 			interceptorCalls = append(interceptorCalls, "interceptor2_before")
-			err := invoker(ctx, method, in, out, enc)
+			err := invoker(ctx, method, enc, in, out)
 			interceptorCalls = append(interceptorCalls, "interceptor2_after")
 			return err
 		}
 
 		// Configure the dial options with a chain of two interceptors
-		dialOpts := drpcinterceptors.NewDialOptions([]drpcinterceptors.DialOption{
-			drpcinterceptors.WithChainUnaryInterceptor(interceptor1, interceptor2),
-		})
+		dialOpts := []DialOption{
+			WithChainUnaryInterceptor(interceptor1, interceptor2),
+		}
 		// Create a client connection with the configured options and connection supplier
-		cc, err := NewClientConnWithOptions(*dialOpts, supplier)
+		cc, err := NewClientConnWithOptions(ctx, dialer, dialOpts...)
+		require.NoError(t, err)
 
 		in, out := "input", ""
 		done := make(chan struct{})
