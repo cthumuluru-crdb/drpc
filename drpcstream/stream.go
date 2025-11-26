@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"runtime/trace"
 	"sync"
 
@@ -65,6 +66,10 @@ type Stream struct {
 		fin    drpcsignal.Signal // set when the stream is finished and all ops are complete
 		cancel drpcsignal.Signal // set when externally canceled
 	}
+
+	// TODO(chandrat): remove these later
+	connID string
+	rpc    string
 }
 
 var _ drpc.Stream = (*Stream)(nil)
@@ -72,15 +77,15 @@ var _ drpc.Stream = (*Stream)(nil)
 // New returns a new stream bound to the context with the given stream id and
 // will use the writer to write messages on. It is important use monotonically
 // increasing stream ids within a single transport.
-func New(ctx context.Context, sid uint64, wr *drpcwire.Writer) *Stream {
-	return NewWithOptions(ctx, sid, wr, Options{})
+func New(ctx context.Context, connID string, rpc string, sid uint64, wr *drpcwire.Writer) *Stream {
+	return NewWithOptions(ctx, connID, rpc, sid, wr, Options{})
 }
 
 // NewWithOptions returns a new stream bound to the context with the given
 // stream id and will use the writer to write messages on. It is important use
 // monotonically increasing stream ids within a single transport. The options
 // are used to control details of how the Stream operates.
-func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts Options) *Stream {
+func NewWithOptions(ctx context.Context, connID string, rpc string, sid uint64, wr *drpcwire.Writer, opts Options) *Stream {
 	var task *trace.Task
 	if trace.IsEnabled() {
 		kind, rpc := drpcopts.GetStreamKind(&opts.Internal), drpcopts.GetStreamRPC(&opts.Internal)
@@ -100,6 +105,9 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts O
 
 		id: drpcwire.ID{Stream: sid},
 		wr: wr.Reset(),
+
+		connID: connID,
+		rpc:    rpc,
 	}
 
 	// initialize the packet buffer
@@ -209,6 +217,22 @@ func (s *Stream) SetManualFlush(mf bool) { s.opts.ManualFlush = mf }
 //
 // packet handler
 //
+
+// func (s *Stream) HandlePacket(pkt drpcwire.Packet) (err error) {
+// 	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		log.Printf("[HandlePacket] connID[%s] rpc[%s] stream[%d]: begin", s.connID, s.rpc, s.ID())
+// 	}
+// 	err = s.doHandlePacket(pkt)
+// 	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		if err != nil {
+// 			log.Printf("[HandlePacket] connID[%s] rpc[%s] stream[%d]: failed: %v", s.connID, s.rpc, s.ID(), err)
+// 		} else {
+// 			log.Printf("[HandlePacket] connID[%s] rpc[%s] stream[%d]: success", s.connID, s.rpc, s.ID())
+// 		}
+// 	}
+
+// 	return err
+// }
 
 // HandlePacket advances the stream state machine by inspecting the packet. It
 // returns any major errors that should terminate the transport the stream is
@@ -360,6 +384,22 @@ func (s *Stream) terminate(err error) {
 // raw read/write
 //
 
+// func (s *Stream) RawWrite(kind drpcwire.Kind, data []byte) (err error) {
+// 	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		log.Printf("[RawWrite] connID[%s] rpc[%s] stream[%d]: begin", s.connID, s.rpc, s.ID())
+// 	}
+// 	err = s.doRawWrite(kind, data)
+// 	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		if err != nil {
+// 			log.Printf("[RawWrite] connID[%s] rpc[%s] stream[%d]: failed: %v", s.connID, s.rpc, s.ID(), err)
+// 		} else {
+// 			log.Printf("[RawWrite] connID[%s] rpc[%s] stream[%d]: success", s.connID, s.rpc, s.ID())
+// 		}
+// 	}
+
+// 	return err
+// }
+
 // RawWrite sends the data bytes with the given kind.
 func (s *Stream) RawWrite(kind drpcwire.Kind, data []byte) (err error) {
 	defer s.checkFinished()
@@ -396,6 +436,22 @@ func (s *Stream) rawWriteLocked(kind drpcwire.Kind, data []byte) (err error) {
 		}
 	}
 }
+
+// func (s *Stream) RawFlush() (err error) {
+// 	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		log.Printf("[RawFlush] connID[%s] rpc[%s] stream[%d]: begin", s.connID, s.rpc, s.ID())
+// 	}
+// 	err = s.doRawFlush()
+// 	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		if err != nil {
+// 			log.Printf("[RawFlush] connID[%s] rpc[%s] stream[%d]: failed: %v", s.connID, s.rpc, s.ID(), err)
+// 		} else {
+// 			log.Printf("[RawFlush] connID[%s] rpc[%s] stream[%d]: success", s.connID, s.rpc, s.ID())
+// 		}
+// 	}
+
+// 	return err
+// }
 
 // RawFlush flushes any buffers of data.
 func (s *Stream) RawFlush() (err error) {
@@ -443,6 +499,22 @@ func (s *Stream) checkRecvFlush() (err error) {
 	return nil
 }
 
+// func (s *Stream) RawRecv() (data []byte, err error) {
+// 	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		log.Printf("[RawRecv] connID[%s] rpc[%s] stream[%d]: begin", s.connID, s.rpc, s.ID())
+// 	}
+// 	data, err = s.doRawRecv()
+// 	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		if err != nil {
+// 			log.Printf("[RawRecv] connID[%s] rpc[%s] stream[%d]: failed: %v", s.connID, s.rpc, s.ID(), err)
+// 		} else {
+// 			log.Printf("[RawRecv] connID[%s] rpc[%s] stream[%d]: success", s.connID, s.rpc, s.ID())
+// 		}
+// 	}
+
+// 	return data, err
+// }
+
 // RawRecv returns the raw bytes received for a message.
 func (s *Stream) RawRecv() (data []byte, err error) {
 	if err := s.checkRecvFlush(); err != nil {
@@ -467,6 +539,22 @@ func (s *Stream) RawRecv() (data []byte, err error) {
 // msg read/write
 //
 
+// func (s *Stream) MsgSend(msg drpc.Message, enc drpc.Encoding) (err error) {
+// 	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		log.Printf("[MsgSend] connID[%s] rpc[%s] stream[%d]: begin", s.connID, s.rpc, s.ID())
+// 	}
+// 	err = s.doMsgSend(msg, enc)
+// 	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		if err != nil {
+// 			log.Printf("[MsgSend] connID[%s] rpc[%s] stream[%d]: failed: %v", s.connID, s.rpc, s.ID(), err)
+// 		} else {
+// 			log.Printf("[MsgSend] connID[%s] rpc[%s] stream[%d]: success", s.connID, s.rpc, s.ID())
+// 		}
+// 	}
+
+// 	return err
+// }
+
 // MsgSend marshals the message with the encoding, writes it, and flushes.
 func (s *Stream) MsgSend(msg drpc.Message, enc drpc.Encoding) (err error) {
 	s.flush.Do(func() {})
@@ -490,6 +578,22 @@ func (s *Stream) MsgSend(msg drpc.Message, enc drpc.Encoding) (err error) {
 	}
 	return nil
 }
+
+// func (s *Stream) MsgRecv(msg drpc.Message, enc drpc.Encoding) (err error) {
+// 	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		log.Printf("[MsgRecv] connID[%s] rpc[%s] stream[%d]: begin", s.connID, s.rpc, s.ID())
+// 	}
+// 	err = s.doMsgRecv(msg, enc)
+// 	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		if err != nil {
+// 			log.Printf("[MsgRecv] connID[%s] rpc[%s] stream[%d]: failed: %v", s.connID, s.rpc, s.ID(), err)
+// 		} else {
+// 			log.Printf("[MsgRecv] connID[%s] rpc[%s] stream[%d]: success", s.connID, s.rpc, s.ID())
+// 		}
+// 	}
+
+// 	return err
+// }
 
 // MsgRecv recives some message data and unmarshals it with enc into msg.
 func (s *Stream) MsgRecv(msg drpc.Message, enc drpc.Encoding) (err error) {
@@ -522,9 +626,25 @@ var (
 	termBothClosed = drpc.Error.New("stream terminated by both issuing close send")
 )
 
+func (s *Stream) SendError(serr error) (err error) {
+	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+		log.Printf("[SendError] connID[%s] rpc[%s] stream[%d]: begin", s.connID, s.rpc, s.ID())
+	}
+	err = s.doSendError(serr)
+	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+		if err != nil {
+			log.Printf("[SendError] connID[%s] rpc[%s] stream[%d]: failed: %v", s.connID, s.rpc, s.ID(), err)
+		} else {
+			log.Printf("[SendError] connID[%s] rpc[%s] stream[%d]: success", s.connID, s.rpc, s.ID())
+		}
+	}
+
+	return err
+}
+
 // SendError terminates the stream and sends the error to the remote. It is a
 // no-op if the stream is already terminated.
-func (s *Stream) SendError(serr error) (err error) {
+func (s *Stream) doSendError(serr error) (err error) {
 	s.log("CALL", func() string { return fmt.Sprintf("SendError(%v)", serr) })
 
 	s.mu.Lock()
@@ -544,11 +664,27 @@ func (s *Stream) SendError(serr error) (err error) {
 	return s.checkCancelError(s.sendPacketLocked(drpcwire.KindError, false, drpcwire.MarshalError(serr)))
 }
 
+func (s *Stream) SendCancel(err error) (busy bool, _ error) {
+	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+		log.Printf("[SendCancel] connID[%s] rpc[%s] stream[%d]: begin", s.connID, s.rpc, s.ID())
+	}
+	busy, err = s.doSendCancel(err)
+	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+		if err != nil {
+			log.Printf("[SendCancel] connID[%s] rpc[%s] stream[%d]: failed: %v", s.connID, s.rpc, s.ID(), err)
+		} else {
+			log.Printf("[SendCancel] connID[%s] rpc[%s] stream[%d]: success", s.connID, s.rpc, s.ID())
+		}
+	}
+
+	return busy, err
+}
+
 // SendCancel transitions the stream into the canceled state with
 // context.Canceled and sends a cancel error to the remote side for a soft
 // cancel. It is a no-op if the stream is already terminated. It returns true
 // for busy if writes are already blocked and a hard cancel is required.
-func (s *Stream) SendCancel(err error) (busy bool, _ error) {
+func (s *Stream) doSendCancel(err error) (busy bool, _ error) {
 	s.log("CALL", func() string { return "SendCancel()" })
 
 	s.mu.Lock()
@@ -573,6 +709,22 @@ func (s *Stream) SendCancel(err error) (busy bool, _ error) {
 	return false, s.checkCancelError(s.sendPacketLocked(drpcwire.KindCancel, true, nil))
 }
 
+// func (s *Stream) Close() (err error) {
+// 	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		log.Printf("[Close] connID[%s] rpc[%s] stream[%d]: begin", s.connID, s.rpc, s.ID())
+// 	}
+// 	err = s.doClose()
+// 	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		if err != nil {
+// 			log.Printf("[Close] connID[%s] rpc[%s] stream[%d]: failed: %v", s.connID, s.rpc, s.ID(), err)
+// 		} else {
+// 			log.Printf("[Close] connID[%s] rpc[%s] stream[%d]: success", s.connID, s.rpc, s.ID())
+// 		}
+// 	}
+
+// 	return err
+// }
+
 // Close terminates the stream and sends that the stream has been closed to the
 // remote. It is a no-op if the stream is already terminated.
 func (s *Stream) Close() (err error) {
@@ -593,6 +745,22 @@ func (s *Stream) Close() (err error) {
 
 	return s.checkCancelError(s.sendPacketLocked(drpcwire.KindClose, false, nil))
 }
+
+// func (s *Stream) CloseSend() (err error) {
+// 	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		log.Printf("[CloseSend] connID[%s] rpc[%s] stream[%d]: begin", s.connID, s.rpc, s.ID())
+// 	}
+// 	err = s.doCloseSend()
+// 	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		if err != nil {
+// 			log.Printf("[CloseSend] connID[%s] rpc[%s] stream[%d]: failed: %v", s.connID, s.rpc, s.ID(), err)
+// 		} else {
+// 			log.Printf("[CloseSend] connID[%s] rpc[%s] stream[%d]: success", s.connID, s.rpc, s.ID())
+// 		}
+// 	}
+
+// 	return err
+// }
 
 // CloseSend informs the remote that no more messages will be sent. If the remote has
 // also already issued a CloseSend, the stream is terminated. It is a no-op if the
@@ -617,10 +785,17 @@ func (s *Stream) CloseSend() (err error) {
 	return s.checkCancelError(s.sendPacketLocked(drpcwire.KindCloseSend, false, nil))
 }
 
+func (s *Stream) Cancel(err error) bool {
+	if s.rpc == "/cockroach.roachpb.KVBatch/Batch" {
+		log.Printf("[Cancel] connID[%s] rpc[%s] stream[%d]: begin", s.connID, s.rpc, s.ID())
+	}
+	return s.doCancel(err)
+}
+
 // Cancel transitions the stream into a state where all writes to the transport will return
 // the provided error, and terminates the stream. It is a no-op if the stream is already
 // finished, and returns a boolean indicating if that was the case.
-func (s *Stream) Cancel(err error) bool {
+func (s *Stream) doCancel(err error) bool {
 	s.log("CALL", func() string { return fmt.Sprintf("Cancel(%v)", err) })
 
 	s.mu.Lock()

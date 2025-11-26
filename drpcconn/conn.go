@@ -5,6 +5,7 @@ package drpcconn
 
 import (
 	"context"
+	"log"
 	"sync"
 
 	"github.com/zeebo/errs"
@@ -103,6 +104,17 @@ func (c *Conn) Close() (err error) { return c.man.Close() }
 // Invoke issues the rpc on the transport serializing in, waits for a response, and
 // deserializes it into out. Only one Invoke or Stream may be open at a time.
 func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) (err error) {
+	log.Printf("[Invoke] connID[%s] rpc[%s]: begin", c.man.ConnID(), rpc)
+	err = c.invoke(ctx, rpc, enc, in, out)
+	if err != nil {
+		log.Printf("[Invoke] connID[%s] rpc[%s]: success", c.man.ConnID(), rpc)
+	} else {
+		log.Printf("[Invoke] connID[%s] rpc[%s]: failed: %v", c.man.ConnID(), rpc, err)
+	}
+	return err
+}
+
+func (c *Conn) invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) (err error) {
 	var metadata []byte
 	if md, ok := drpcmetadata.Get(ctx); ok {
 		metadata, err = drpcmetadata.Encode(metadata, md)

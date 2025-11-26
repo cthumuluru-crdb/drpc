@@ -54,6 +54,9 @@ type Options struct {
 
 	// Internal contains options that are for internal use only.
 	Internal drpcopts.Manager
+
+	// Unique connection ID
+	ConnID string
 }
 
 // Manager handles the logic of managing a transport for a drpc client or
@@ -292,15 +295,15 @@ func (m *Manager) manageReader() {
 //
 
 // newStream creates a stream value with the appropriate configuration for this manager.
-func (m *Manager) newStream(ctx context.Context, sid uint64, kind, rpc string) (*drpcstream.Stream, error) {
+func (m *Manager) newStream(ctx context.Context, connID string, sid uint64, kind, rpc string) (*drpcstream.Stream, error) {
 	opts := m.opts.Stream
 	drpcopts.SetStreamKind(&opts.Internal, kind)
 	drpcopts.SetStreamRPC(&opts.Internal, rpc)
 	if cb := drpcopts.GetManagerStatsCB(&m.opts.Internal); cb != nil {
 		drpcopts.SetStreamStats(&opts.Internal, cb(rpc))
 	}
+	stream := drpcstream.NewWithOptions(ctx, connID, rpc, sid, m.wr, opts)
 
-	stream := drpcstream.NewWithOptions(ctx, sid, m.wr, opts)
 	select {
 	case m.streams <- streamInfo{ctx: ctx, stream: stream}:
 		m.sbuf.Set(stream)
@@ -421,7 +424,11 @@ func (m *Manager) NewClientStream(ctx context.Context, rpc string) (stream *drpc
 		return nil, err
 	}
 
-	return m.newStream(ctx, m.sbuf.Get().ID()+1, "cli", rpc)
+	return m.newStream(ctx, m.opts.ConnID, m.sbuf.Get().ID()+1, "cli", rpc)
+}
+
+func (m *Manager) ConnID() string {
+	return m.opts.ConnID
 }
 
 // NewServerStream starts a stream on the managed transport for use by a server.
@@ -480,7 +487,7 @@ func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Strea
 					ctx = drpcmetadata.AddPairs(ctx, meta)
 				}
 
-				stream, err := m.newStream(ctx, pkt.ID.Stream, "srv", rpc)
+				stream, err := m.newStream(ctx, m.opts.ConnID, pkt.ID.Stream, "srv", rpc)
 				return stream, rpc, err
 
 			default:

@@ -6,6 +6,7 @@ package drpcserver
 import (
 	"context"
 	"crypto/tls"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -118,8 +119,21 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 		}
 	}
 
+	// TODO(chandrat): generate a unique connection ID.
+	connID := make([]byte, 8)
+	n, err := tr.Read(connID)
+	if err != nil || n < 8 {
+		tr.Close()
+		return errs.New("drpcserver: failed to read connection ID")
+	}
+	s.opts.Manager.ConnID = string(connID)
+
+	log.Printf("[ServeOne] connID[%s]: starting DRPC manager", string(connID))
 	man := drpcmanager.NewWithOptions(tr, s.opts.Manager)
-	defer func() { err = errs.Combine(err, man.Close()) }()
+	defer func() {
+		err = errs.Combine(err, man.Close())
+		log.Printf("[ServeOne] connID[%s]: DRPC manager closed with error: %v", string(connID), err)
+	}()
 
 	cache := drpccache.New()
 	defer cache.Clear()
@@ -129,9 +143,11 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 	for {
 		stream, rpc, err := man.NewServerStream(ctx)
 		if err != nil {
+			log.Printf("[ServeOne] connID[%s]: error creating new stream: %v", string(connID), err)
 			return errs.Wrap(err)
 		}
 		if err := s.handleRPC(stream, rpc); err != nil {
+			log.Printf("[ServeOne] connID[%s]: error handling rpc [%s]: %v", string(connID), rpc, err)
 			return errs.Wrap(err)
 		}
 	}
@@ -186,6 +202,21 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) (err error) {
 		})
 	}
 }
+
+// func (s *Server) handleRPC(stream *drpcstream.Stream, connID, rpc string) (err error) {
+// 	if rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		log.Printf("[handleRPC] connID[%s] rpc[%s]: begin", connID, rpc)
+// 	}
+// 	err = s.doHandleRPC(stream, rpc)
+// 	if rpc == "/cockroach.roachpb.KVBatch/Batch" {
+// 		if err != nil {
+// 			log.Printf("[handleRPC] connID[%s] rpc[%s]: failed: %v", connID, rpc, err)
+// 		} else {
+// 			log.Printf("[handleRPC] connID[%s] rpc[%s]: success", connID, rpc)
+// 		}
+// 	}
+// 	return err
+// }
 
 // handleRPC handles the rpc that has been requested by the stream.
 func (s *Server) handleRPC(stream *drpcstream.Stream, rpc string) (err error) {

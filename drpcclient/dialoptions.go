@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 
+	"github.com/google/uuid"
 	"storj.io/drpc/drpcconn"
 	"storj.io/drpc/drpcmanager"
 	"storj.io/drpc/drpcstream"
@@ -107,6 +108,14 @@ func DialContext(ctx context.Context, address string, opts ...DialOption) (*drpc
 		netConn = tls.Client(netConn, tlsConfig)
 	}
 
+	// TODO(chandrat): generate a conn ID to correlate the logs.
+	id := uuid.New().String() // generate a unique connection ID.
+	n, err := netConn.Write([]byte(id)[0:8])
+	if err != nil || n < 8 {
+		netConn.Close()
+		return nil, err
+	}
+
 	return drpcconn.NewWithOptions(netConn, drpcconn.Options{
 		Manager: drpcmanager.Options{
 			Reader: drpcwire.ReaderOptions{
@@ -115,6 +124,7 @@ func DialContext(ctx context.Context, address string, opts ...DialOption) (*drpc
 			Stream: drpcstream.Options{
 				MaximumBufferSize: 0, // unlimited
 			},
+			ConnID:     string(id[0:8]),
 			SoftCancel: true, // don't close the transport when stream context is canceled
 		},
 	}), nil
