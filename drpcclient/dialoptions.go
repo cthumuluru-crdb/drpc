@@ -115,7 +115,7 @@ func DialContext(ctx context.Context, address string, opts ...DialOption) (*drpc
 			Stream: drpcstream.Options{
 				MaximumBufferSize: 0, // unlimited
 			},
-			SoftCancel: true, // don't close the transport when stream context is canceled
+			SoftCancel: false,
 		},
 	}), nil
 }
