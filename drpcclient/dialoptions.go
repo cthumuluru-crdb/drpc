@@ -6,6 +6,8 @@ import (
 	"math"
 	"net"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"storj.io/drpc/drpcconn"
 	"storj.io/drpc/drpcmanager"
 	"storj.io/drpc/drpcstream"
@@ -90,8 +92,12 @@ func DialContext(ctx context.Context, address string, opts ...DialOption) (*drpc
 		dialer := &net.Dialer{}
 		return dialer.DialContext(ctx, "tcp", address)
 	}()
+	// gRPC classifies connection failures as Unavailable. Connection
+	// errors include failures during TCP dialing as well as the TLS
+	// handshake. For backward compatibility, we mirror gRPC's behavior
+	// and return the same status codes to clients.
 	if err != nil {
-		return nil, err
+		return nil, status.Error(codes.Unavailable, err.Error())
 	}
 
 	if options.tlsConfig != nil {
@@ -105,6 +111,11 @@ func DialContext(ctx context.Context, address string, opts ...DialOption) (*drpc
 		}
 		tlsConfig.ServerName = sn
 		netConn = tls.Client(netConn, tlsConfig)
+
+		err = netConn.(*tls.Conn).HandshakeContext(ctx)
+		if err != nil {
+			return nil, status.Error(codes.Unavailable, err.Error())
+		}
 	}
 
 	return drpcconn.NewWithOptions(netConn, drpcconn.Options{
