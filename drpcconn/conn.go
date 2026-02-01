@@ -103,6 +103,8 @@ func (c *Conn) Close() (err error) { return c.man.Close() }
 // Invoke issues the rpc on the transport serializing in, waits for a response, and
 // deserializes it into out. Only one Invoke or Stream may be open at a time.
 func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) (err error) {
+	defer func() { err = drpc.ToRPCErr(err) }()
+
 	var metadata []byte
 	metadata, err = c.encodeMetadata(ctx)
 	if err != nil {
@@ -156,6 +158,8 @@ func (c *Conn) doInvoke(stream *drpcstream.Stream, enc drpc.Encoding, rpc string
 // NewStream begins a streaming rpc on the connection. Only one Invoke or Stream may
 // be open at a time.
 func (c *Conn) NewStream(ctx context.Context, rpc string, enc drpc.Encoding) (_ drpc.Stream, err error) {
+	defer func() { err = drpc.ToRPCErr(err) }()
+
 	var metadata []byte
 	metadata, err = c.encodeMetadata(ctx)
 	if err != nil {

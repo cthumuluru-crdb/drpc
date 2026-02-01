@@ -9,10 +9,12 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/zeebo/assert"
+	"google.golang.org/grpc/status"
 
 	"storj.io/drpc/drpcstream"
 	"storj.io/drpc/drpctest"
@@ -231,9 +233,27 @@ func runRandomized(t *testing.T, prog []byte, r runner) {
 //
 
 func expectedError(err error) bool {
-	return errors.Is(err, io.EOF) ||
-		errors.Is(err, context.Canceled) ||
-		(err != nil && err.Error() == "")
+	if err == nil {
+		return false
+	}
+	// Standard expected errors
+	if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	// Legacy format: empty error message
+	if err.Error() == "" {
+		return true
+	}
+	// gRPC status errors are expected when random data happens to parse as valid protobuf
+	if _, ok := status.FromError(err); ok {
+		return true
+	}
+	// Wire format errors are expected when random data is sent as error frames
+	errMsg := err.Error()
+	if strings.HasPrefix(errMsg, "drpcwire:") {
+		return true
+	}
+	return false
 }
 
 func parseOp(op byte) (cmd byte, arg int, done bool) {

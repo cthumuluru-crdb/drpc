@@ -1,11 +1,11 @@
 module storj.io/drpc
 
-go 1.19
+go 1.23.0
 
 require (
 	github.com/stretchr/testify v1.10.0
-	github.com/zeebo/assert v1.3.0
-	github.com/zeebo/errs v1.2.2
+	github.com/zeebo/assert v1.3.1
+	github.com/zeebo/errs v1.4.0
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20230525234030-28d5490b6b19
 	google.golang.org/grpc v1.57.2
 	google.golang.org/protobuf v1.30.0

@@ -109,7 +109,7 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 		// anyway.
 		err := tlsConn.Handshake()
 		if err != nil {
-			return err
+			return drpc.ConnectionError.New("server handshake [%q] failed: %w", tlsConn.RemoteAddr(), err)
 		}
 		state := tlsConn.ConnectionState()
 		if len(state.PeerCertificates) > 0 {

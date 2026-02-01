@@ -469,6 +469,8 @@ func (s *Stream) RawRecv() (data []byte, err error) {
 
 // MsgSend marshals the message with the encoding, writes it, and flushes.
 func (s *Stream) MsgSend(msg drpc.Message, enc drpc.Encoding) (err error) {
+	defer func() { err = drpc.ToRPCErr(err) }()
+
 	s.flush.Do(func() {})
 
 	defer s.checkFinished()
@@ -493,6 +495,8 @@ func (s *Stream) MsgSend(msg drpc.Message, enc drpc.Encoding) (err error) {
 
 // MsgRecv recives some message data and unmarshals it with enc into msg.
 func (s *Stream) MsgRecv(msg drpc.Message, enc drpc.Encoding) (err error) {
+	defer func() { err = drpc.ToRPCErr(err) }()
+
 	if err := s.checkRecvFlush(); err != nil {
 		return err
 	}
