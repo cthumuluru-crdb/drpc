@@ -12,10 +12,11 @@ import (
 
 // These error classes represent some common errors that drpc generates.
 var (
-	Error         = errs.Class("drpc")
-	InternalError = errs.Class("internal error")
-	ProtocolError = errs.Class("protocol error")
-	ClosedError   = errs.Class("closed")
+	Error           = errs.Class("drpc")
+	InternalError   = errs.Class("internal error")
+	ProtocolError   = errs.Class("protocol error")
+	ConnectionError = errs.Class("connection error")
+	ClosedError     = errs.Class("closed")
 )
 
 // Transport is an interface describing what is required for a drpc connection.

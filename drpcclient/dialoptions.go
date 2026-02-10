@@ -6,8 +6,7 @@ import (
 	"math"
 	"net"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"storj.io/drpc"
 	"storj.io/drpc/drpcconn"
 	"storj.io/drpc/drpcmanager"
 	"storj.io/drpc/drpcstream"
@@ -79,13 +78,16 @@ func WithContextDialer(dialer func(context.Context, string) (net.Conn, error)) D
 	}
 }
 
-func DialContext(ctx context.Context, address string, opts ...DialOption) (*drpcconn.Conn, error) {
+func DialContext(ctx context.Context, address string, opts ...DialOption) (conn *drpcconn.Conn, err error) {
+	defer func() { err = drpc.ToRPCErr(err) }()
+
 	var options dialOptions
 	for _, opt := range opts {
 		opt(&options)
 	}
 
-	netConn, err := func() (net.Conn, error) {
+	var netConn net.Conn
+	netConn, err = func() (net.Conn, error) {
 		if options.dialer != nil {
 			return options.dialer(ctx, address)
 		}
@@ -97,7 +99,7 @@ func DialContext(ctx context.Context, address string, opts ...DialOption) (*drpc
 	// handshake. For backward compatibility, we mirror gRPC's behavior
 	// and return the same status codes to clients.
 	if err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
+		return nil, drpc.ConnectionError.New("error while dialing target [%s]: %w", address, err)
 	}
 
 	if options.tlsConfig != nil {
@@ -105,16 +107,17 @@ func DialContext(ctx context.Context, address string, opts ...DialOption) (*drpc
 		// original copy.
 		tlsConfig := options.tlsConfig.Clone()
 		// Set the ServerName for TLS verification.
-		sn, _, err := net.SplitHostPort(address)
+		var sn string
+		sn, _, err = net.SplitHostPort(address)
 		if err != nil {
-			return nil, err
+			return nil, drpc.InternalError.New("invalid address [%s]: %w", address, err)
 		}
 		tlsConfig.ServerName = sn
 		netConn = tls.Client(netConn, tlsConfig)
 
 		err = netConn.(*tls.Conn).HandshakeContext(ctx)
 		if err != nil {
-			return nil, status.Error(codes.Unavailable, err.Error())
+			return nil, drpc.ConnectionError.New("client handshake [%q] failed: %w", address, err)
 		}
 	}
 

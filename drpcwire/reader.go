@@ -63,7 +63,10 @@ func (r *Reader) read(p []byte) (n int, err error) {
 	for i := 0; i < 100; i++ {
 		if r.rerr != nil {
 			r.rerr, err = nil, r.rerr
-			return 0, err
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return 0, err
+			}
+			return 0, drpc.ConnectionError.Wrap(err)
 		}
 		n, r.rerr = r.r.Read(p)
 		if n > 0 {
