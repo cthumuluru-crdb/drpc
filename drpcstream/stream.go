@@ -250,6 +250,7 @@ func (s *Stream) HandlePacket(pkt drpcwire.Packet) (err error) {
 	case drpcwire.KindCancel:
 		err := context.Canceled
 		s.sigs.cancel.Set(err)
+		s.ctx.sig.Set(err) // cancel stream.Context() immediately
 		s.sigs.send.Set(io.EOF) // in this state, gRPC returns io.EOF on send.
 		s.terminate(err)
 		return nil

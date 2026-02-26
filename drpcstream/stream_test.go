@@ -327,3 +327,38 @@ func TestStream_SendCancelBusyDuringBlockedClose(t *testing.T) {
 	assert.NoError(t, err)
 	assert.That(t, busy)
 }
+
+func TestStream_ContextCanceledOnCancelPacket(t *testing.T) {
+	// This test verifies that stream.Context().Done() is closed immediately
+	// when a KindCancel packet is received, without waiting for the stream
+	// to be fully finished. This matches gRPC semantics where context
+	// cancellation propagates immediately.
+
+	ctx := context.Background()
+	st := New(ctx, 0, drpcwire.NewWriter(io.Discard, 0))
+
+	// Verify the context is not done initially
+	select {
+	case <-st.Context().Done():
+		t.Fatal("context should not be done before cancel packet")
+	default:
+	}
+
+	// Send a KindCancel packet
+	err := st.HandlePacket(drpcwire.Packet{
+		Kind:    drpcwire.KindCancel,
+		Control: true,
+	})
+	assert.NoError(t, err)
+
+	// Verify the context is done immediately
+	select {
+	case <-st.Context().Done():
+		// expected
+	default:
+		t.Fatal("context should be done after cancel packet")
+	}
+
+	// Verify the context error is context.Canceled
+	assert.Equal(t, context.Canceled, st.Context().Err())
+}
