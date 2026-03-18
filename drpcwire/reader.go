@@ -82,23 +82,15 @@ func (r *Reader) ReadPacket() (pkt Packet, err error) {
 	return r.ReadPacketUsing(nil)
 }
 
-// ReadPacketUsing reads a packet from the io.Reader. IDs read from
-// frames must be monotonically increasing. When a new ID is read, the
-// old data is discarded. This allows for easier asynchronous interrupts.
-// If the amount of data in the Packet becomes too large, an error is
-// returned. The returned packet's Data field is constructed by appending
-// to the provided buf after it has been resliced to be zero length.
-func (r *Reader) ReadPacketUsing(buf []byte) (pkt Packet, err error) {
-	pkt.Data = buf[:0]
-
-	var fr Frame
-	var ok bool
-
+// readFrameUsing reads the next complete Frame from the underlying reader,
+// buffering partial data in r.buf until a full frame is available.
+func (r *Reader) readFrameUsing() (fr Frame, err error) {
 	for {
+		var ok bool
 		r.curr, fr, ok, err = ParseFrame(r.curr)
 		switch {
 		case err != nil:
-			return Packet{}, drpc.ProtocolError.Wrap(err)
+			return Frame{}, drpc.ProtocolError.Wrap(err)
 
 		case !ok:
 			// r.curr doesn't have enough data for a full frame, so prepend
@@ -115,27 +107,46 @@ func (r *Reader) ReadPacketUsing(buf []byte) (pkt Packet, err error) {
 
 			n, err := r.read(r.buf[len(r.buf):cap(r.buf)])
 			if err != nil {
-				return Packet{}, err
+				return Frame{}, err
 			}
 
 			ncap := uint(len(r.buf) + n)
 			if ncap > uint(cap(r.buf)) {
-				return Packet{}, drpc.ProtocolError.New("data overflow")
+				return Frame{}, drpc.ProtocolError.New("data overflow")
 			}
 			r.buf = r.buf[:ncap]
 
 			if len(r.buf)-maxFrameOverhead > r.opts.MaximumBufferSize {
-				return Packet{}, drpc.ProtocolError.New("data overflow")
+				return Frame{}, drpc.ProtocolError.New("data overflow")
 			}
 
 			r.curr = r.buf
 			continue
 		}
 
-		// since we got a packet, signal that we need to restore buf with
-		// whatever remains in r.curr the next time we don't have a packet.
+		// since we got a frame, signal that we need to restore buf with
+		// whatever remains in r.curr the next time we don't have a frame.
 		if len(r.buf) > 0 {
 			r.buf = r.buf[:0]
+		}
+
+		return fr, nil
+	}
+}
+
+// ReadPacketUsing reads a packet from the io.Reader. IDs read from
+// frames must be monotonically increasing. When a new ID is read, the
+// old data is discarded. This allows for easier asynchronous interrupts.
+// If the amount of data in the Packet becomes too large, an error is
+// returned. The returned packet's Data field is constructed by appending
+// to the provided buf after it has been resliced to be zero length.
+func (r *Reader) ReadPacketUsing(buf []byte) (pkt Packet, err error) {
+	pkt.Data = buf[:0]
+
+	for {
+		fr, err := r.readFrameUsing()
+		if err != nil {
+			return Packet{}, err
 		}
 
 		// If any frames are set to control, then the whole packet is
