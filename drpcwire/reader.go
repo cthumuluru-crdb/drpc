@@ -20,20 +20,10 @@ type ReaderOptions struct {
 type Reader struct {
 	opts ReaderOptions
 	r    io.Reader
-	curr []byte
-	buf  []byte
+	fr   *frameReader
 	id   ID
 	rerr error
 }
-
-// A frame adds at most this many bytes of overhead to some data by prefixing
-// the data with:
-//
-//	1: control byte
-//	9: maximum varint stream id
-//	9: maximum varint message id
-//	9: maximum varint data length
-const maxFrameOverhead = 1 + 9 + 9 + 9
 
 // NewReader constructs a Reader to read Packets from the io.Reader.
 func NewReader(r io.Reader) *Reader {
@@ -49,10 +39,7 @@ func NewReaderWithOptions(r io.Reader, opts ReaderOptions) *Reader {
 
 	return &Reader{
 		opts: opts,
-		r:    r,
-		// Err on the side of a smaller buffer since ReadPacket will lazily
-		// grow this buffer.
-		curr: make([]byte, 0, 4096),
+		fr:   newFrameReaderWithOptions(r, frameReaderOptions{MaximumBufferSize: opts.MaximumBufferSize}),
 		id:   ID{Stream: 1, Message: 1},
 	}
 }
@@ -82,58 +69,6 @@ func (r *Reader) ReadPacket() (pkt Packet, err error) {
 	return r.ReadPacketUsing(nil)
 }
 
-// readFrameUsing reads the next complete Frame from the underlying reader,
-// buffering partial data in r.buf until a full frame is available.
-func (r *Reader) readFrameUsing() (fr Frame, err error) {
-	for {
-		var ok bool
-		r.curr, fr, ok, err = ParseFrame(r.curr)
-		switch {
-		case err != nil:
-			return Frame{}, drpc.ProtocolError.Wrap(err)
-
-		case !ok:
-			// r.curr doesn't have enough data for a full frame, so prepend
-			// it to the read buffer if it is in the appropriate state.
-			if len(r.buf) == 0 {
-				r.buf = append(r.buf[:0], r.curr...)
-			}
-
-			if cap(r.buf)-len(r.buf) < 4096 {
-				nbuf := make([]byte, len(r.buf), 2*cap(r.buf)+4096)
-				copy(nbuf, r.buf)
-				r.buf = nbuf
-			}
-
-			n, err := r.read(r.buf[len(r.buf):cap(r.buf)])
-			if err != nil {
-				return Frame{}, err
-			}
-
-			ncap := uint(len(r.buf) + n)
-			if ncap > uint(cap(r.buf)) {
-				return Frame{}, drpc.ProtocolError.New("data overflow")
-			}
-			r.buf = r.buf[:ncap]
-
-			if len(r.buf)-maxFrameOverhead > r.opts.MaximumBufferSize {
-				return Frame{}, drpc.ProtocolError.New("data overflow")
-			}
-
-			r.curr = r.buf
-			continue
-		}
-
-		// since we got a frame, signal that we need to restore buf with
-		// whatever remains in r.curr the next time we don't have a frame.
-		if len(r.buf) > 0 {
-			r.buf = r.buf[:0]
-		}
-
-		return fr, nil
-	}
-}
-
 // ReadPacketUsing reads a packet from the io.Reader. IDs read from
 // frames must be monotonically increasing. When a new ID is read, the
 // old data is discarded. This allows for easier asynchronous interrupts.
@@ -144,7 +79,7 @@ func (r *Reader) ReadPacketUsing(buf []byte) (pkt Packet, err error) {
 	pkt.Data = buf[:0]
 
 	for {
-		fr, err := r.readFrameUsing()
+		fr, err := r.fr.ReadFrameUsing()
 		if err != nil {
 			return Packet{}, err
 		}

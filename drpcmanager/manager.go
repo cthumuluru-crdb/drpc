@@ -218,6 +218,7 @@ func (m *Manager) terminate(err error) {
 // to ensure that no one is reading on the reader. It sets the term signal if
 // there is any error reading packets.
 func (m *Manager) manageReader() {
+	// (chandrat): who uses read signal?
 	defer m.sigs.read.Set(nil)
 
 	var pkt drpcwire.Packet
@@ -228,6 +229,8 @@ func (m *Manager) manageReader() {
 		// if we have a run of "small" packets, drop the buffer to release
 		// memory so that a burst of large packets does not cause eternally
 		// large heap usage.
+		//
+		// (chandrat) elaborate on the rational and add better comments.
 		if run > 10 {
 			pkt.Data = nil
 			run = 0
@@ -253,6 +256,9 @@ func (m *Manager) manageReader() {
 	again:
 		switch curr := m.sbuf.Get(); {
 		// if the packet is for the current stream, deliver it.
+		//
+		// (chandrat) this is where we decide where the packet should go
+		// in case of stream multiplexing.
 		case curr != nil && pkt.ID.Stream == curr.ID():
 			if err := curr.HandlePacket(pkt); err != nil {
 				m.terminate(managerClosed.Wrap(err))
@@ -260,17 +266,41 @@ func (m *Manager) manageReader() {
 			}
 
 		// if an old message has been sent, just ignore it.
+		//
+		// (chandrat): we can have more than one streams active at a time
+		// and it's possible we can receive a packet that started a while
+		// back and still active. We cannot just ignore the packet if the
+		// packet is for some older stream unless it is a "create new stream"
+		// packet.
 		case curr != nil && pkt.ID.Stream < curr.ID():
 
 		// if any invoke sequence is being sent, close any old unterminated
 		// stream and forward it to be handled.
 		case pkt.Kind == drpcwire.KindInvoke || pkt.Kind == drpcwire.KindInvokeMetadata:
+			// (chandrat): this is wrong with stream multiplexing. If a new
+			// "invoke" or "invoke metadata" packet is received, we should
+			// check if the stream ID is smaller than what we already created.
+			// If yes, don't entertain that packet. We should look at HTTP/2
+			// spec to understand the details here.
 			if curr != nil && !curr.IsTerminated() {
 				curr.Cancel(context.Canceled)
 			}
 
 			select {
 			case m.pkts <- pkt:
+				// (chandrat): at this point we are done using the packet.
+				// We now have to wait for the signal to reuse the packet
+				// buffer. We receive this signal once the packet written
+				// to "pkts" buffer is consumed.
+				//
+				// I wish the methods are not Recv() and Send() in this
+				// case. They are Recv() and Send() because the construct
+				// used is a lazy channel where Send() and Recv() makes
+				// sense. Maybe, awaitNotification() and Notify() may have
+				// been better choices. Explore other intuitive choices.
+				//
+				// Also, check if this packet buffer changes in anyway with
+				// stream multiplexing.
 				m.pdone.Recv()
 
 			case <-m.sigs.term.Signal():
@@ -280,6 +310,8 @@ func (m *Manager) manageReader() {
 		// a non-invoke packet should be delivered to some stream so we wait for
 		// a new stream to be created and try again. like an invoke, we
 		// implicitly close any previous stream.
+		//
+		// (chandrat): how does this change with stream multiplexing?
 		default:
 			if curr != nil && !curr.IsTerminated() {
 				curr.Cancel(context.Canceled)
@@ -469,46 +501,63 @@ func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Strea
 			return nil, "", m.sigs.term.Err()
 
 		case pkt := <-m.pkts:
-			switch pkt.Kind {
-			// keep track of any metadata being sent before an invoke so that we
-			// can include it if the stream id matches the eventual invoke.
-			case drpcwire.KindInvokeMetadata:
-				meta, err = drpcmetadata.Decode(pkt.Data)
-				m.pdone.Send()
-
-				if err != nil {
-					return nil, "", err
-				}
-				metaID = pkt.ID.Stream
-
-			case drpcwire.KindInvoke:
-				rpc = string(pkt.Data)
-				m.pdone.Send()
-
-				if metaID == pkt.ID.Stream {
-					if m.opts.GRPCMetadataCompatMode {
-						// Populate incoming metadata as grpc metadata in the
-						// context. This is a short-term fix that will enable us
-						// to send and receive grpc metadata when DRPC is enabled,
-						// without any changes in the calling code.
-						grpcMeta := make(map[string][]string, len(meta))
-						for k, v := range meta {
-							grpcMeta[k] = []string{v}
-						}
-						ctx = grpcmetadata.NewIncomingContext(ctx, grpcMeta)
-					} else {
-						// Add metadata to the incoming context.
-						ctx = drpcmetadata.NewIncomingContext(ctx, meta)
-					}
-				}
-				stream, err := m.newStream(ctx, pkt.ID.Stream, drpc.StreamKindServer, rpc)
-				return stream, rpc, err
-
-			default:
-				// this should never happen, but defensive.
-				m.pdone.Send()
+			var s *drpcstream.Stream
+			ctx, s, rpc, err = m.handleInvokePacket(ctx, pkt, &meta, &metaID)
+			if err != nil || s != nil {
+				return s, rpc, err
 			}
 		}
+	}
+}
+
+// handleInvokePacket processes a KindInvokeMetadata or KindInvoke packet
+// received during NewServerStream. It updates the accumulated metadata state
+// via the meta and metaID pointers. When a KindInvoke packet is processed, it
+// creates a new server stream and returns it as the second return value; the
+// caller should return in that case. Otherwise a nil stream is returned and the
+// caller should continue waiting for the next packet.
+func (m *Manager) handleInvokePacket(ctx context.Context, pkt drpcwire.Packet, meta *map[string]string, metaID *uint64) (context.Context, *drpcstream.Stream, string, error) {
+	switch pkt.Kind {
+	// keep track of any metadata being sent before an invoke so that we
+	// can include it if the stream id matches the eventual invoke.
+	case drpcwire.KindInvokeMetadata:
+		var err error
+		*meta, err = drpcmetadata.Decode(pkt.Data)
+		m.pdone.Send()
+
+		if err != nil {
+			return ctx, nil, "", err
+		}
+		*metaID = pkt.ID.Stream
+		return ctx, nil, "", nil
+
+	case drpcwire.KindInvoke:
+		rpc := string(pkt.Data)
+		m.pdone.Send()
+
+		if *metaID == pkt.ID.Stream {
+			if m.opts.GRPCMetadataCompatMode {
+				// Populate incoming metadata as grpc metadata in the
+				// context. This is a short-term fix that will enable us
+				// to send and receive grpc metadata when DRPC is enabled,
+				// without any changes in the calling code.
+				grpcMeta := make(map[string][]string, len(*meta))
+				for k, v := range *meta {
+					grpcMeta[k] = []string{v}
+				}
+				ctx = grpcmetadata.NewIncomingContext(ctx, grpcMeta)
+			} else {
+				// Add metadata to the incoming context.
+				ctx = drpcmetadata.NewIncomingContext(ctx, *meta)
+			}
+		}
+		stream, err := m.newStream(ctx, pkt.ID.Stream, drpc.StreamKindServer, rpc)
+		return ctx, stream, rpc, err
+
+	default:
+		// this should never happen, but defensive.
+		m.pdone.Send()
+		return ctx, nil, "", nil
 	}
 }
 
