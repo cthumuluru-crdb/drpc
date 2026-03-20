@@ -73,9 +73,9 @@ func (r *frameReader) read(p []byte) (n int, err error) {
 	return 0, drpc.InternalError.Wrap(io.ErrNoProgress)
 }
 
-// ReadFrameUsing reads the next complete Frame from the underlying reader,
+// ReadFrame reads the next complete Frame from the underlying reader,
 // buffering partial data in r.buf until a full frame is available.
-func (r *frameReader) ReadFrameUsing() (fr Frame, err error) {
+func (r *frameReader) ReadFrame() (fr Frame, err error) {
 	for {
 		var ok bool
 		r.curr, fr, ok, err = ParseFrame(r.curr)

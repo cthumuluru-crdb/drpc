@@ -79,7 +79,7 @@ func (r *Reader) ReadPacketUsing(buf []byte) (pkt Packet, err error) {
 	pkt.Data = buf[:0]
 
 	for {
-		fr, err := r.fr.ReadFrameUsing()
+		fr, err := r.fr.ReadFrame()
 		if err != nil {
 			return Packet{}, err
 		}
