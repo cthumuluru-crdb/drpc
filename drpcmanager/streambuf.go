@@ -5,53 +5,69 @@ package drpcmanager
 
 import (
 	"sync"
-	"sync/atomic"
 
 	"storj.io/drpc/drpcstream"
 )
 
-type streamBuffer struct {
-	mu     sync.Mutex
-	cond   sync.Cond
-	stream atomic.Pointer[drpcstream.Stream]
-	closed bool
+type activeStreams struct {
+	mu          sync.RWMutex
+	cond        sync.Cond
+	streams     map[uint64]*drpcstream.Stream
+	maxStreamID uint64
+	closed      bool
 }
 
-func (sb *streamBuffer) init() {
+func (sb *activeStreams) init() {
 	sb.cond.L = &sb.mu
+	sb.streams = make(map[uint64]*drpcstream.Stream)
 }
 
-func (sb *streamBuffer) Close() {
+func (sb *activeStreams) Close() {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
 
+	sb.streams = nil
 	sb.closed = true
 	sb.cond.Broadcast()
 }
 
-func (sb *streamBuffer) Get() *drpcstream.Stream {
-	return sb.stream.Load()
+func (sb *activeStreams) GetMaxStream() *drpcstream.Stream {
+	sb.mu.RLock()
+	defer sb.mu.RUnlock()
+
+	return sb.streams[sb.maxStreamID]
 }
 
-func (sb *streamBuffer) Set(stream *drpcstream.Stream) {
+func (sb *activeStreams) Register(stream *drpcstream.Stream) {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
 
 	if sb.closed {
 		return
 	}
+	sb.streams[stream.ID()] = stream
 
-	sb.stream.Store(stream)
+	// TODO(chandrat) with multiplexing we don't need this.
+	if sb.maxStreamID < stream.ID() {
+		sb.maxStreamID = stream.ID()
+	}
 	sb.cond.Broadcast()
 }
 
-func (sb *streamBuffer) Wait(sid uint64) bool {
+func (sb *activeStreams) Unregister(sid uint64) {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
 
-	for !sb.closed && sb.Get().ID() == sid {
+	delete(sb.streams, sid)
+	sb.cond.Broadcast()
+}
+
+func (sb *activeStreams) Wait(sid uint64) bool {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+
+	for !sb.closed && sb.maxStreamID == sid {
 		sb.cond.Wait()
 	}
-
 	return !sb.closed
 }

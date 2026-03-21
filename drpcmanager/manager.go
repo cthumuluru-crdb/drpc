@@ -72,12 +72,12 @@ type Manager struct {
 	rd   *drpcwire.Reader
 	opts Options
 
-	sem     drpcsignal.Chan      // held by the active stream
-	sbuf    streamBuffer         // largest stream id created
-	pkts    chan drpcwire.Packet // channel for invoke packets
-	pdone   drpcsignal.Chan      // signals when a packets buffers can be reused
-	sfin    chan struct{}        // shared signal for stream finished
-	streams chan streamInfo      // channel to signal that a stream should start
+	sem           drpcsignal.Chan      // held by the active stream
+	activeStreams activeStreams        // largest stream id created
+	pkts          chan drpcwire.Packet // channel for invoke packets
+	pdone         drpcsignal.Chan      // signals when a packets buffers can be reused
+	sfin          chan struct{}        // shared signal for stream finished
+	streams       chan streamInfo      // channel to signal that a stream should start
 
 	sigs struct {
 		term   drpcsignal.Signal // set when the manager should start terminating
@@ -112,7 +112,7 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 	}
 
 	// initialize the stream buffer
-	m.sbuf.init()
+	m.activeStreams.init()
 
 	// this semaphore controls the number of concurrent streams. it MUST be 1.
 	m.sem.Make(1)
@@ -174,7 +174,7 @@ func (m *Manager) acquireSemaphore(ctx context.Context) error {
 // longer make any reads or writes on the transport. It exits early if the
 // context is canceled or the manager is terminated.
 func (m *Manager) waitForPreviousStream(ctx context.Context) (err error) {
-	prev := m.sbuf.Get()
+	prev := m.activeStreams.GetMaxStream()
 	if prev == nil {
 		return nil
 	}
@@ -205,7 +205,7 @@ func (m *Manager) terminate(err error) {
 	if m.sigs.term.Set(err) {
 		m.log("TERM", func() string { return fmt.Sprint(err) })
 		m.sigs.tport.Set(m.tr.Close())
-		m.sbuf.Close()
+		m.activeStreams.Close()
 	}
 }
 
@@ -235,7 +235,7 @@ func (m *Manager) manageReader() {
 		}
 
 	again:
-		switch curr := m.sbuf.Get(); {
+		switch curr := m.activeStreams.GetMaxStream(); {
 
 		// if an old message has been sent, just ignore it.
 		case curr != nil && fr.ID.Stream < curr.ID():
@@ -283,7 +283,7 @@ func (m *Manager) manageReader() {
 				curr.Cancel(context.Canceled)
 			}
 
-			if !m.sbuf.Wait(curr.ID()) {
+			if !m.activeStreams.Wait(curr.ID()) {
 				return
 			}
 			goto again
@@ -307,7 +307,7 @@ func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKin
 	stream := drpcstream.NewWithOptions(ctx, sid, m.wr, opts)
 	select {
 	case m.streams <- streamInfo{ctx: ctx, stream: stream}:
-		m.sbuf.Set(stream)
+		m.activeStreams.Register(stream)
 		m.log("STREAM", stream.String)
 		return stream, nil
 
@@ -349,6 +349,7 @@ func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
 		m.sem.Recv()
 
 	case <-m.sfin:
+		// m.activeStreams.Unregister(stream.ID())
 		m.sem.Recv()
 
 	case <-ctx.Done():
@@ -370,6 +371,7 @@ func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
 
 			// wait for the stream to signal that it is finished.
 			<-m.sfin
+			// m.activeStreams.Unregister(stream.ID())
 		} else {
 			// If the stream isn't already finished, we have to terminate the
 			// transport to do an active cancel. If it is already finished,
@@ -383,6 +385,7 @@ func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
 
 			// wait for the stream to signal that it is finished.
 			<-m.sfin
+			// m.activeStreams.Unregister(stream.ID())
 
 			// allow a new stream to begin.
 			m.sem.Recv()
@@ -405,7 +408,7 @@ func (m *Manager) Closed() <-chan struct{} {
 // the return result is only valid until the next call to NewClientStream or
 // NewServerStream.
 func (m *Manager) Unblocked() <-chan struct{} {
-	if prev := m.sbuf.Get(); prev != nil {
+	if prev := m.activeStreams.GetMaxStream(); prev != nil {
 		return prev.Context().Done()
 	}
 	return closedCh
@@ -428,7 +431,7 @@ func (m *Manager) NewClientStream(ctx context.Context, rpc string) (stream *drpc
 		return nil, err
 	}
 
-	return m.newStream(ctx, m.sbuf.Get().ID()+1, drpc.StreamKindClient, rpc)
+	return m.newStream(ctx, m.activeStreams.GetMaxStream().ID()+1, drpc.StreamKindClient, rpc)
 }
 
 // NewServerStream starts a stream on the managed transport for use by a server.
