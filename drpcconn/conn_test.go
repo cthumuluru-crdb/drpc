@@ -17,6 +17,23 @@ import (
 	"storj.io/drpc/drpcwire"
 )
 
+// readPacket assembles frames from rd into a complete packet.
+func readPacket(rd *drpcwire.Reader) (drpcwire.Packet, error) {
+	var b drpcwire.PacketBuilder
+	for {
+		fr, err := rd.ReadFrame()
+		if err != nil {
+			return drpcwire.Packet{}, err
+		}
+		if err := b.AppendFrame(fr); err != nil {
+			return drpcwire.Packet{}, err
+		}
+		if pkt, ok := b.Build(); ok {
+			return pkt, nil
+		}
+	}
+}
+
 // Dummy encoding, which assumes the drpc.Message is a *string.
 type testEncoding struct{}
 
@@ -43,9 +60,9 @@ func TestConn_InvokeFlushesSendClose(t *testing.T) {
 		wr := drpcwire.NewWriter(ps, 64)
 		rd := drpcwire.NewReader(ps)
 
-		_, _ = rd.ReadPacket()    // Invoke
-		_, _ = rd.ReadPacket()    // Message
-		pkt, _ := rd.ReadPacket() // CloseSend
+		_, _ = readPacket(rd)    // Invoke
+		_, _ = readPacket(rd)    // Message
+		pkt, _ := readPacket(rd) // CloseSend
 
 		_ = wr.WritePacket(drpcwire.Packet{
 			Data: []byte("qux"),
@@ -54,8 +71,8 @@ func TestConn_InvokeFlushesSendClose(t *testing.T) {
 		})
 		_ = wr.Flush()
 
-		_, _ = rd.ReadPacket() // Close
-		<-invokeDone           // wait for invoke to return
+		_, _ = readPacket(rd) // Close
+		<-invokeDone          // wait for invoke to return
 
 		// ensure that any later packets are dropped by writing one
 		// before closing the transport.
@@ -98,7 +115,7 @@ func TestConn_InvokeSendsGrpcAndDrpcMetadata(t *testing.T) {
 		wr := drpcwire.NewWriter(ps, 64)
 		rd := drpcwire.NewReader(ps)
 
-		md, err := rd.ReadPacket() // Metadata
+		md, err := readPacket(rd) // Metadata
 		assert.NoError(t, err)
 		assert.Equal(t, md.Kind, drpcwire.KindInvokeMetadata)
 		metadata, err := drpcmetadata.Decode(md.Data)
@@ -110,9 +127,9 @@ func TestConn_InvokeSendsGrpcAndDrpcMetadata(t *testing.T) {
 			"common-key":           "common-value2",
 		})
 
-		_, _ = rd.ReadPacket()    // Invoke
-		_, _ = rd.ReadPacket()    // Message
-		pkt, _ := rd.ReadPacket() // CloseSend
+		_, _ = readPacket(rd)    // Invoke
+		_, _ = readPacket(rd)    // Message
+		pkt, _ := readPacket(rd) // CloseSend
 
 		_ = wr.WritePacket(drpcwire.Packet{
 			Data: []byte("qux"),
@@ -121,7 +138,7 @@ func TestConn_InvokeSendsGrpcAndDrpcMetadata(t *testing.T) {
 		})
 		_ = wr.Flush()
 
-		_, _ = rd.ReadPacket() // Close
+		_, _ = readPacket(rd) // Close
 	})
 
 	conn := New(pc)
@@ -154,7 +171,7 @@ func TestConn_NewStreamSendsGrpcAndDrpcMetadata(t *testing.T) {
 	ctx.Run(func(ctx context.Context) {
 		rd := drpcwire.NewReader(ps)
 
-		md, err := rd.ReadPacket() // Metadata
+		md, err := readPacket(rd) // Metadata
 		assert.NoError(t, err)
 		assert.Equal(t, md.Kind, drpcwire.KindInvokeMetadata)
 		metadata, err := drpcmetadata.Decode(md.Data)
@@ -164,8 +181,8 @@ func TestConn_NewStreamSendsGrpcAndDrpcMetadata(t *testing.T) {
 			"drpc-key": "drpc-value",
 		})
 
-		_, _ = rd.ReadPacket() // Invoke
-		_, _ = rd.ReadPacket() // CloseSend
+		_, _ = readPacket(rd) // Invoke
+		_, _ = readPacket(rd) // CloseSend
 	})
 
 	conn := New(pc)

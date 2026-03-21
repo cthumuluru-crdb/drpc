@@ -15,12 +15,28 @@ import (
 	"github.com/zeebo/assert"
 )
 
-func TestReader(t *testing.T) {
+// readPacket reads frames from rd and assembles them into a complete packet
+// using the provided PacketBuilder.
+func readPacket(rd *Reader, b *PacketBuilder) (Packet, error) {
+	for {
+		fr, err := rd.ReadFrame()
+		if err != nil {
+			return Packet{}, err
+		}
+		if err := b.AppendFrame(fr); err != nil {
+			return Packet{}, err
+		}
+		if pkt, ok := b.Build(); ok {
+			return pkt, nil
+		}
+	}
+}
+
+func TestPacketBuilder(t *testing.T) {
 	type testCase struct {
 		Packets []Packet
 		Frames  []Frame
 		Error   string
-		Options ReaderOptions
 	}
 
 	p := func(kind Kind, id uint64, control bool, data string) Packet {
@@ -49,15 +65,6 @@ func TestReader(t *testing.T) {
 		}
 	}
 
-	megaFrames := make([]Frame, 0, 10*1024)
-	for i := 0; i < 10*1024; i++ {
-		megaFrames = append(megaFrames, f(KindMessage, 1, strings.Repeat("X", 1024), false, false))
-	}
-	megaFrames = append(megaFrames, f(KindMessage, 1, "", true, false))
-
-	// 1 more than the maximum frame overhead is the minimum required to overflow
-	const overFrame = maxFrameOverhead + 1
-
 	cases := []testCase{
 		m(p(KindMessage, 1, false, "hello world"),
 			f(KindMessage, 1, "hello", false, false),
@@ -77,40 +84,13 @@ func TestReader(t *testing.T) {
 		{
 			Packets: []Packet{
 				p(KindClose, 2, false, ""),
+				p(KindMessage, 1, false, "1"),
 			},
 			Frames: []Frame{
 				f(KindMessage, 1, "1", false, false),
 				f(KindClose, 2, "", true, false),
 				f(KindMessage, 1, "1", true, false),
 			},
-			Error: "id monotonicity violation",
-		},
-
-		{ // a single frame that's too large
-			Frames: []Frame{f(KindMessage, 1, strings.Repeat("X", 4<<20+overFrame), true, false)},
-			Error:  "data overflow",
-		},
-
-		{ // a single frame that's too large with limited size
-			Frames:  []Frame{f(KindMessage, 1, strings.Repeat("X", 1000+overFrame), true, false)},
-			Error:   "data overflow",
-			Options: ReaderOptions{MaximumBufferSize: 1000},
-		},
-
-		{ // multiple frames that make too large a packet
-			Frames: megaFrames,
-			Error:  "data overflow",
-		},
-
-		{ // multiple frames that make too large a packet with limited size
-			Frames: []Frame{
-				f(KindMessage, 1, strings.Repeat("X", 500), false, false),
-				f(KindMessage, 1, strings.Repeat("X", 400), false, false),
-				f(KindMessage, 1, strings.Repeat("X", 100), false, false),
-				f(KindMessage, 1, strings.Repeat("X", overFrame), true, false),
-			},
-			Error:   "data overflow",
-			Options: ReaderOptions{MaximumBufferSize: 1000},
 		},
 
 		{ // Control bit is preserved
@@ -134,25 +114,15 @@ func TestReader(t *testing.T) {
 			Error: "packet kind change",
 		},
 
-		{ // id monotonicity from id reuse
+		{ // message ID can be reused after a packet is delivered (no cross-packet monotonicity)
 			Packets: []Packet{
 				p(KindMessage, 1, false, "1"),
+				p(KindMessage, 1, false, "2"),
 			},
 			Frames: []Frame{
 				f(KindMessage, 1, "1", true, false),
 				f(KindMessage, 1, "2", true, false),
 			},
-			Error: "id monotonicity violation",
-		},
-
-		{ // message id zero is not allowed
-			Frames: []Frame{{ID: ID{Stream: 1, Message: 0}}},
-			Error:  "id monotonicity violation",
-		},
-
-		{ // stream id zero is not allowed
-			Frames: []Frame{{ID: ID{Stream: 0, Message: 1}}},
-			Error:  "id monotonicity violation",
 		},
 	}
 
@@ -162,14 +132,15 @@ func TestReader(t *testing.T) {
 			buf = AppendFrame(buf, fr)
 		}
 
-		rd := NewReaderWithOptions(bytes.NewReader(buf), tc.Options)
+		rd := NewReader(bytes.NewReader(buf))
+		var b PacketBuilder
 		for _, expPkt := range tc.Packets {
-			pkt, err := rd.ReadPacket()
+			pkt, err := readPacket(rd, &b)
 			assert.NoError(t, err)
 			assert.DeepEqual(t, expPkt, pkt)
 		}
 
-		_, err := rd.ReadPacket()
+		_, err := readPacket(rd, &b)
 		assert.Error(t, err)
 		if tc.Error != "" {
 			assert.That(t, strings.Contains(err.Error(), tc.Error))
@@ -179,7 +150,7 @@ func TestReader(t *testing.T) {
 	}
 }
 
-func TestReaderRandomized(t *testing.T) {
+func TestPacketBuilderRandomized(t *testing.T) {
 	seed := time.Now().UnixNano()
 	t.Log("seed:", seed)
 	rng := rand.New(rand.NewSource(seed))
@@ -219,9 +190,10 @@ func TestReaderRandomized(t *testing.T) {
 	// exact sequence of bytes, so we reset bid to generate
 	// the sequence again.
 	bid = 0
-	r := NewReader(bytes.NewBuffer(buf))
+	rd := NewReader(bytes.NewReader(buf))
+	var b PacketBuilder
 	for i := 1; ; i++ {
-		pkt, err := r.ReadPacket()
+		pkt, err := readPacket(rd, &b)
 		if errors.Is(err, io.EOF) {
 			break
 		}
@@ -230,10 +202,6 @@ func TestReaderRandomized(t *testing.T) {
 		assert.Equal(t, pkt.Data, get(len(pkt.Data)))
 	}
 }
-
-type readerFunc func([]byte) (int, error)
-
-func (fn readerFunc) Read(p []byte) (int, error) { return fn(p) }
 
 func TestReaderErrorWithData(t *testing.T) {
 	r := NewReader(readerFunc(func(b []byte) (int, error) {
@@ -246,7 +214,8 @@ func TestReaderErrorWithData(t *testing.T) {
 		return len(out), io.EOF
 	}))
 
-	pkt, err := r.ReadPacket()
+	var b PacketBuilder
+	pkt, err := readPacket(r, &b)
 	assert.NoError(t, err)
 	assert.Equal(t, pkt, Packet{
 		Data:    []byte("test"),
@@ -255,7 +224,7 @@ func TestReaderErrorWithData(t *testing.T) {
 		Control: false,
 	})
 
-	_, err = r.ReadPacket()
+	_, err = readPacket(r, &b)
 	assert.Equal(t, err, io.EOF)
 }
 
@@ -264,6 +233,12 @@ func TestReaderErrorNoProgress(t *testing.T) {
 		return 0, nil
 	}))
 
-	_, err := r.ReadPacket()
+	var b PacketBuilder
+	_, err := readPacket(r, &b)
 	assert.That(t, errors.Is(err, io.ErrNoProgress))
 }
+
+// readerFunc is an io.Reader backed by a function.
+type readerFunc func([]byte) (int, error)
+
+func (fn readerFunc) Read(p []byte) (int, error) { return fn(p) }

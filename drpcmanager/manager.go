@@ -213,30 +213,19 @@ func (m *Manager) terminate(err error) {
 // manage reader
 //
 
-// manageReader is always reading a packet and dispatching it to the appropriate
+// manageReader is always reading a frame and dispatching it to the appropriate
 // stream or queue. It sets the read signal when it exits so that one can wait
 // to ensure that no one is reading on the reader. It sets the term signal if
-// there is any error reading packets.
+// there is any error reading frames.
 func (m *Manager) manageReader() {
-	// (chandrat): who uses read signal?
 	defer m.sigs.read.Set(nil)
 
-	var pkt drpcwire.Packet
-	var err error
-	var run int
+	// invokePktBuilder assembles frames for KindInvoke and KindInvokeMetadata
+	// into a complete packet before sending to NewServerStream.
+	var invokePktBuilder drpcwire.PacketBuilder
 
 	for !m.sigs.term.IsSet() {
-		// if we have a run of "small" packets, drop the buffer to release
-		// memory so that a burst of large packets does not cause eternally
-		// large heap usage.
-		//
-		// (chandrat) elaborate on the rational and add better comments.
-		if run > 10 {
-			pkt.Data = nil
-			run = 0
-		}
-
-		pkt, err = m.rd.ReadPacketUsing(pkt.Data[:0])
+		fr, err := m.rd.ReadFrame()
 		if err != nil {
 			if isConnectionReset(err) {
 				err = drpc.ClosedError.Wrap(err)
@@ -245,73 +234,50 @@ func (m *Manager) manageReader() {
 			return
 		}
 
-		if len(pkt.Data) < cap(pkt.Data)/4 {
-			run++
-		} else {
-			run = 0
-		}
-
-		m.log("READ", pkt.String)
-
 	again:
 		switch curr := m.sbuf.Get(); {
-		// if the packet is for the current stream, deliver it.
-		//
-		// (chandrat) this is where we decide where the packet should go
-		// in case of stream multiplexing.
-		case curr != nil && pkt.ID.Stream == curr.ID():
-			if err := curr.HandlePacket(pkt); err != nil {
-				m.terminate(managerClosed.Wrap(err))
-				return
-			}
 
 		// if an old message has been sent, just ignore it.
-		//
-		// (chandrat): we can have more than one streams active at a time
-		// and it's possible we can receive a packet that started a while
-		// back and still active. We cannot just ignore the packet if the
-		// packet is for some older stream unless it is a "create new stream"
-		// packet.
-		case curr != nil && pkt.ID.Stream < curr.ID():
+		case curr != nil && fr.ID.Stream < curr.ID():
 
 		// if any invoke sequence is being sent, close any old unterminated
 		// stream and forward it to be handled.
-		case pkt.Kind == drpcwire.KindInvoke || pkt.Kind == drpcwire.KindInvokeMetadata:
-			// (chandrat): this is wrong with stream multiplexing. If a new
-			// "invoke" or "invoke metadata" packet is received, we should
-			// check if the stream ID is smaller than what we already created.
-			// If yes, don't entertain that packet. We should look at HTTP/2
-			// spec to understand the details here.
+		case fr.Kind == drpcwire.KindInvoke || fr.Kind == drpcwire.KindInvokeMetadata:
 			if curr != nil && !curr.IsTerminated() {
 				curr.Cancel(context.Canceled)
 			}
 
+			// accumulate frames into a packet until the last frame arrives.
+			if err := invokePktBuilder.AppendFrame(fr); err != nil {
+				if isConnectionReset(err) {
+					err = drpc.ClosedError.Wrap(err)
+				}
+				m.terminate(managerClosed.Wrap(err))
+				return
+			}
+			pkt, ok := invokePktBuilder.Build()
+			if !ok {
+				continue
+			}
+
 			select {
 			case m.pkts <- pkt:
-				// (chandrat): at this point we are done using the packet.
-				// We now have to wait for the signal to reuse the packet
-				// buffer. We receive this signal once the packet written
-				// to "pkts" buffer is consumed.
-				//
-				// I wish the methods are not Recv() and Send() in this
-				// case. They are Recv() and Send() because the construct
-				// used is a lazy channel where Send() and Recv() makes
-				// sense. Maybe, awaitNotification() and Notify() may have
-				// been better choices. Explore other intuitive choices.
-				//
-				// Also, check if this packet buffer changes in anyway with
-				// stream multiplexing.
 				m.pdone.Recv()
 
 			case <-m.sigs.term.Signal():
 				return
 			}
 
+		// if the packet is for the current stream, deliver it.
+		case curr != nil && fr.ID.Stream == curr.ID():
+			if err := curr.HandleFrame(fr); err != nil {
+				m.terminate(managerClosed.Wrap(err))
+				return
+			}
+
 		// a non-invoke packet should be delivered to some stream so we wait for
 		// a new stream to be created and try again. like an invoke, we
 		// implicitly close any previous stream.
-		//
-		// (chandrat): how does this change with stream multiplexing?
 		default:
 			if curr != nil && !curr.IsTerminated() {
 				curr.Cancel(context.Canceled)

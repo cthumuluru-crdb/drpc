@@ -57,7 +57,7 @@ type Stream struct {
 	pbuf packetBuffer
 	wbuf []byte
 
-	rpkt drpcwire.Packet // in-progress incoming packet
+	rpkt drpcwire.PacketBuilder // in-progress incoming packet
 
 	mu   sync.Mutex // protects state transitions
 	sigs struct {
@@ -292,36 +292,14 @@ func (s *Stream) HandleFrame(fr drpcwire.Frame) (err error) {
 		return nil
 	}
 
-	switch {
-	// frame IDs must be monotonically increasing within a packet.
-	case fr.ID.Less(s.rpkt.ID):
-		return drpc.ProtocolError.New("id monotonicity violation (fr:%v pkt:%v)", fr.ID, s.rpkt.ID)
-
-	// a new ID means we start assembling a new packet.
-	case s.rpkt.ID == drpcwire.ID{} || s.rpkt.ID != fr.ID:
-		s.rpkt = drpcwire.Packet{
-			ID:   fr.ID,
-			Kind: fr.Kind,
-			Data: []byte{},
-		}
-
-	// all frames belonging to the same packet must have the same kind.
-	case fr.Kind != s.rpkt.Kind:
-		return drpc.ProtocolError.New("packet kind change (fr:%v pkt:%v)", fr.Kind, s.rpkt.Kind)
+	if err := s.rpkt.AppendFrame(fr); err != nil {
+		return err
 	}
 
-	// accumulate frame data and control bits into the in-progress packet.
-	s.rpkt.Data = append(s.rpkt.Data, fr.Data...)
-	s.rpkt.Control = s.rpkt.Control || fr.Control
-
-	// wait for more frames if this one is not the last.
-	if !fr.Done {
+	pkt, ok := s.rpkt.Build()
+	if !ok {
 		return nil
 	}
-
-	// packet is complete: deliver it and reset assembly state.
-	pkt := s.rpkt
-	s.rpkt = drpcwire.Packet{}
 
 	return s.HandlePacket(pkt)
 }

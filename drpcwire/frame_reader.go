@@ -9,15 +9,16 @@ import (
 	"storj.io/drpc"
 )
 
-// frameReaderOptions controls configuration settings for a reader.
-type frameReaderOptions struct {
+// ReaderOptions controls configuration settings for a reader.
+type ReaderOptions struct {
 	// MaximumBufferSize controls the maximum size of buffered
-	// packet data.
+	// frame data.
 	MaximumBufferSize int
 }
 
-type frameReader struct {
-	opts frameReaderOptions
+// Reader reads frames from an io.Reader.
+type Reader struct {
+	opts ReaderOptions
 	r    io.Reader
 	curr []byte
 	buf  []byte
@@ -33,17 +34,22 @@ type frameReader struct {
 //	9: maximum varint data length
 const maxFrameOverhead = 1 + 9 + 9 + 9
 
-// NewReaderWithOptions constructs a Reader to read Packets from
+// NewReader constructs a Reader to read Frames from the io.Reader.
+func NewReader(r io.Reader) *Reader {
+	return NewReaderWithOptions(r, ReaderOptions{})
+}
+
+// NewReaderWithOptions constructs a Reader to read Frames from
 // the io.Reader. It uses the provided options to manage buffering.
-func newFrameReaderWithOptions(r io.Reader, opts frameReaderOptions) *frameReader {
+func NewReaderWithOptions(r io.Reader, opts ReaderOptions) *Reader {
 	if opts.MaximumBufferSize == 0 {
 		opts.MaximumBufferSize = 4 << 20 // Default to 4MiB.
 	}
 
-	return &frameReader{
+	return &Reader{
 		opts: opts,
 		r:    r,
-		// Err on the side of a smaller buffer since ReadPacket will lazily
+		// Err on the side of a smaller buffer since ReadFrame will lazily
 		// grow this buffer.
 		curr: make([]byte, 0, 4096),
 	}
@@ -51,7 +57,7 @@ func newFrameReaderWithOptions(r io.Reader, opts frameReaderOptions) *frameReade
 
 // read calls Read on the underlying reader and ensures the the return
 // value is (>0, nil) or (0, err).
-func (r *frameReader) read(p []byte) (n int, err error) {
+func (r *Reader) read(p []byte) (n int, err error) {
 	for i := 0; i < 100; i++ {
 		if r.rerr != nil {
 			r.rerr, err = nil, r.rerr
@@ -70,7 +76,7 @@ func (r *frameReader) read(p []byte) (n int, err error) {
 
 // ReadFrame reads the next complete Frame from the underlying reader,
 // buffering partial data in r.buf until a full frame is available.
-func (r *frameReader) ReadFrame() (fr Frame, err error) {
+func (r *Reader) ReadFrame() (fr Frame, err error) {
 	for {
 		var ok bool
 		r.curr, fr, ok, err = ParseFrame(r.curr)
