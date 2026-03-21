@@ -21,7 +21,7 @@ type Reader struct {
 	opts ReaderOptions
 	fr   *frameReader
 
-	// id, nFrames, and pkt track the current packet being assembled.
+	// id and pkt track the current packet being assembled.
 	// Will eventually be replaced with a map from stream ID to in-progress
 	// packet for stream multiplexing.
 	id  ID
@@ -42,7 +42,7 @@ func NewReaderWithOptions(r io.Reader, opts ReaderOptions) *Reader {
 
 	return &Reader{
 		opts: opts,
-		fr:   newFrameReaderWithOptions(r, frameReaderOptions{MaximumBufferSize: opts.MaximumBufferSize}),
+		fr:   newFrameReaderWithOptions(r, frameReaderOptions(opts)),
 		id:   ID{Stream: 1, Message: 1},
 	}
 }

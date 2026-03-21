@@ -33,11 +33,6 @@ type frameReader struct {
 //	9: maximum varint data length
 const maxFrameOverhead = 1 + 9 + 9 + 9
 
-// NewReader constructs a Reader to read Packets from the io.Reader.
-func newFrameReader(r io.Reader) *frameReader {
-	return newFrameReaderWithOptions(r, frameReaderOptions{})
-}
-
 // NewReaderWithOptions constructs a Reader to read Packets from
 // the io.Reader. It uses the provided options to manage buffering.
 func newFrameReaderWithOptions(r io.Reader, opts frameReaderOptions) *frameReader {
