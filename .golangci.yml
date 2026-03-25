@@ -1,8 +1,14 @@
+version: "2"
+
 run:
-  deadline: 10m
+  timeout: 10m
   issues-exit-code: 1
   tests: true
 
+
+formatters:
+  enable:
+    - gofmt                   # sanity check formatting
 
 linters:
   enable:
@@ -10,7 +16,6 @@ linters:
     - dogsled                 # checks for too many ignored arguments
     - durationcheck           # verifies whether durations are multiplied, usually a mistake
     - gocritic                # checks for style, performance issues, and common programming errors
-    - gofmt                   # sanity check formatting
     - goprintffuncname        # checks that printf-like functions are named with `f` at the end [fast: true, auto-fix: false]
     - govet                   # check standard vet rules
     - importas                # verify that imports are consistent
@@ -26,7 +31,6 @@ linters:
     #TODO#- forcetypeassert   # needs work to replace unchecked interface type assertion
     #TODO#- gochecknoglobals  # needs work to remove globals
     #TODO#- gochecknoinits    # needs work to remove init()
-    #TODO#- gofumpt           # not sure whether it's useful
     #TODO#- nestif            # looks useful, however needs work
     #TODO#- prealloc          # easy optimizations
     #TODO#- unparam           # check for unused parameters
@@ -44,17 +48,14 @@ linters:
     - exhaustive       # doesn't handle default case
     - forbidigo        # not useful
     - funlen           # no limit on func length
-    - gci              # we have custom import checking
     - gocognit         # this complexity is not a good metric
     - goconst          # check for things that could be replaced by constants
     - gocyclo          # this complexity is not a good metric
     - godox            # too many false positivies
     - goheader         # separate tool
-    - goimports        # disabled, because it's slow, using scripts/check-imports.go instead.
     - gomoddirectives  # not useful
     - gomodguard       # not useful
     - gosec            # needs tweaking
-    - gosimple         # part of staticcheck
     - lll              # don't need this check
     - nlreturn         # non-important code style
     - paralleltest     # too many false positives
@@ -63,7 +64,6 @@ linters:
     - rowserrcheck     # checks if sql.Rows.Err is checked correctly - Disabled  because it reports false positive with defer statements after Query call
     - sqlclosecheck    # we have tagsql, which checks this better
     - staticcheck      # we use the separate staticcheck binary already
-    - stylecheck       # has false positives
     - tagliatelle      # not our style
     - testpackage      # sometimes it's useful to have tests on private funcs
     - thelper          # too many false positives
@@ -75,7 +75,7 @@ linters:
 
 output:
   formats:
-    - format: colored-line-number
+    colored-line-number: {}
   print-issued-lines: true
   print-linter-name: true
 

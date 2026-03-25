@@ -25,6 +25,14 @@ lint:
 	staticcheck $(PKG)
 	golangci-lint run
 
+.PHONY: test-integration
+test-integration:
+	cd internal/integration && XDG_CONFIG_HOME=$$(mktemp -d) $(GO) test -count=1 -timeout=300s -v
+
+.PHONY: test-integration-race
+test-integration-race:
+	cd internal/integration && XDG_CONFIG_HOME=$$(mktemp -d) $(GO) test -race -count=1 -timeout=300s -v
+
 .PHONY: gen-bazel
 gen-bazel:
 	@echo "Generating WORKSPACE"
