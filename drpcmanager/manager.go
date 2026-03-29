@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -74,10 +75,11 @@ type Manager struct {
 	lastFrameID   drpcwire.ID
 	lastFrameKind drpcwire.Kind
 
-	sem     drpcsignal.Chan // held by the active stream
-	sbuf    streamBuffer    // largest stream id created
-	sfin    chan struct{}   // shared signal for stream finished
-	streams chan streamInfo // channel to signal that a stream should start
+	wg sync.WaitGroup // tracks active manageStream goroutines
+
+	sem  drpcsignal.Chan // held by the active stream
+	sbuf streamBuffer    // largest stream id created
+	sfin chan struct{}   // shared signal for stream finished
 
 	pdone            drpcsignal.Chan      // signals when NewServerStream has registered the new stream
 	serverStreamReqs chan serverStreamReq // new server stream request from manageReader to NewServerStream
@@ -87,10 +89,9 @@ type Manager struct {
 	pa       drpcwire.PacketAssembler // assembles invoke/metadata frames into packets
 
 	sigs struct {
-		term   drpcsignal.Signal // set when the manager should start terminating
-		stream drpcsignal.Signal // set when the manage streams goroutine is done
-		read   drpcsignal.Signal // set after the goroutine reading from the transport is done
-		tport  drpcsignal.Signal // set after the transport has been closed
+		term  drpcsignal.Signal // set when the manager should start terminating
+		read  drpcsignal.Signal // set after the goroutine reading from the transport is done
+		tport drpcsignal.Signal // set after the transport has been closed
 	}
 }
 
@@ -100,11 +101,6 @@ type serverStreamReq struct {
 	sid      uint64
 	metadata map[string]string
 	data     []byte // RPC name bytes from the KindInvoke packet
-}
-
-type streamInfo struct {
-	ctx    context.Context
-	stream *drpcstream.Stream
 }
 
 // New returns a new Manager for the transport.
@@ -123,8 +119,7 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 
 		serverStreamReqs: make(chan serverStreamReq),
 
-		sfin:    make(chan struct{}, 1),
-		streams: make(chan streamInfo),
+		sfin: make(chan struct{}, 1),
 	}
 
 	// initialize the stream buffer
@@ -143,7 +138,6 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 	drpcopts.SetStreamFin(&m.opts.Stream.Internal, m.sfin)
 
 	go m.manageReader()
-	go m.manageStreams()
 
 	return m
 }
@@ -352,36 +346,20 @@ func (m *Manager) newStream(
 	}
 
 	stream := drpcstream.NewWithOptions(ctx, sid, m.wr, opts)
-	select {
-	case m.streams <- streamInfo{ctx: ctx, stream: stream}:
-		m.sbuf.Set(stream)
-		m.log("STREAM", stream.String)
-		return stream, nil
 
-	case <-m.sigs.term.Signal():
-		return nil, m.sigs.term.Err()
-	}
-}
+	m.wg.Add(1)
+	go m.manageStream(ctx, stream)
 
-// manageStreams reads from the streams channel for stream infos and runs the
-// manageStream function on them.
-func (m *Manager) manageStreams() {
-	defer m.sigs.stream.Set(nil)
+	m.sbuf.Set(stream)
+	m.log("STREAM", stream.String)
 
-	for {
-		select {
-		case si := <-m.streams:
-			m.manageStream(si.ctx, si.stream)
-
-		case <-m.sigs.term.Signal():
-			return
-		}
-	}
+	return stream, nil
 }
 
 // manageStream watches the context and the stream and returns when the stream
 // is finished, canceling the stream if the context is canceled.
 func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
+	defer m.wg.Done()
 	select {
 	case <-m.sigs.term.Signal():
 		err := m.sigs.term.Err()
@@ -462,7 +440,7 @@ func (m *Manager) Unblocked() <-chan struct{} {
 func (m *Manager) Close() error {
 	m.terminate(managerClosed.New("Close called"))
 
-	m.sigs.stream.Wait()
+	m.wg.Wait() // wait for all stream goroutines
 	m.sigs.read.Wait()
 	m.sigs.tport.Wait()
 
