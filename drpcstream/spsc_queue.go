@@ -7,6 +7,12 @@ import (
 	"sync"
 )
 
+// defaultPacketBufferSize is the number of messages the packet buffer can
+// hold before the producer blocks. This decouples the transport reader
+// from the consumer (RPC handler), preventing deadlocks when the handler
+// is delayed before calling Recv.
+const defaultPacketBufferSize = 10
+
 // spscQueue is a bounded single-producer / single-consumer queue for byte
 // slices. It is implemented as a ring buffer with mutex+cond synchronization.
 //
