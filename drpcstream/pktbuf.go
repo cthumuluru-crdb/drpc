@@ -3,83 +3,32 @@
 
 package drpcstream
 
-import (
-	"sync"
-)
+// defaultPacketBufferSize is the number of messages the packetBuffer can
+// hold before the producer blocks. This decouples the transport reader
+// from the consumer (RPC handler), preventing deadlocks when the handler
+// is delayed before calling Recv.
+const defaultPacketBufferSize = 10
 
 type packetBuffer struct {
-	mu   sync.Mutex
-	cond sync.Cond
-	err  error
-	data []byte
-	set  bool
-	held bool
+	q *spscQueue
 }
 
 func (pb *packetBuffer) init() {
-	pb.cond.L = &pb.mu
+	pb.q = newSPSCQueue(defaultPacketBufferSize)
 }
 
 func (pb *packetBuffer) Close(err error) {
-	pb.mu.Lock()
-	defer pb.mu.Unlock()
-
-	for pb.held {
-		pb.cond.Wait()
-	}
-
-	if pb.err == nil {
-		pb.data = nil
-		pb.set = false
-		pb.err = err
-		pb.cond.Broadcast()
-	}
+	pb.q.Close(err)
 }
 
 func (pb *packetBuffer) Put(data []byte) {
-	pb.mu.Lock()
-	defer pb.mu.Unlock()
-
-	for pb.set && pb.err == nil {
-		pb.cond.Wait()
-	}
-	if pb.err != nil {
-		return
-	}
-
-	pb.data = data
-	pb.set = true
-	pb.held = false
-	pb.cond.Broadcast()
-
-	for pb.set || pb.held {
-		pb.cond.Wait()
-	}
+	pb.q.Enqueue(data)
 }
 
 func (pb *packetBuffer) Get() ([]byte, error) {
-	pb.mu.Lock()
-	defer pb.mu.Unlock()
-
-	for !pb.set && pb.err == nil {
-		pb.cond.Wait()
-	}
-	if pb.err != nil {
-		return nil, pb.err
-	}
-
-	pb.held = true
-	pb.cond.Broadcast()
-
-	return pb.data, nil
+	return pb.q.Dequeue()
 }
 
 func (pb *packetBuffer) Done() {
-	pb.mu.Lock()
-	defer pb.mu.Unlock()
-
-	pb.data = nil
-	pb.set = false
-	pb.held = false
-	pb.cond.Broadcast()
+	pb.q.Done()
 }

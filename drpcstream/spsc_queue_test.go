@@ -158,14 +158,21 @@ func TestSPSCQueue_CloseUnblocksConsumer(t *testing.T) {
 	}
 }
 
-func TestSPSCQueue_CloseDropsPendingItems(t *testing.T) {
+func TestSPSCQueue_CloseDrainsPendingItems(t *testing.T) {
 	q := newSPSCQueue(4)
 	q.Enqueue([]byte("pending"))
 
 	closeErr := errors.New("closed")
 	q.Close(closeErr)
 
-	_, err := q.Dequeue()
+	// Pending items are drained before the close error is returned.
+	data, err := q.Dequeue()
+	assert.NoError(t, err)
+	assert.DeepEqual(t, data, []byte("pending"))
+	q.Done()
+
+	// Now the queue is empty and closed.
+	_, err = q.Dequeue()
 	assert.Equal(t, err, closeErr)
 }
 
