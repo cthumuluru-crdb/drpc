@@ -82,9 +82,11 @@ func (q *spscQueue) Dequeue() ([]byte, error) {
 	for q.len == 0 && q.err == nil {
 		q.cond.Wait()
 	}
-	if q.err != nil {
+	if q.len == 0 {
+		// Queue is empty and closed — return the close error.
 		return nil, q.err
 	}
+	// Return data even if closed, draining pending items first.
 
 	data := q.slots[q.tail&q.mask]
 	q.held = true
