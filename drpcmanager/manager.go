@@ -74,12 +74,17 @@ type Manager struct {
 	lastFrameID   drpcwire.ID
 	lastFrameKind drpcwire.Kind
 
-	sem     drpcsignal.Chan      // held by the active stream
-	sbuf    streamBuffer         // largest stream id created
-	pkts    chan drpcwire.Packet // channel for invoke packets
-	pdone   drpcsignal.Chan      // signals when a packets buffers can be reused
-	sfin    chan struct{}        // shared signal for stream finished
-	streams chan streamInfo      // channel to signal that a stream should start
+	sem     drpcsignal.Chan // held by the active stream
+	sbuf    streamBuffer    // largest stream id created
+	sfin    chan struct{}   // shared signal for stream finished
+	streams chan streamInfo // channel to signal that a stream should start
+
+	pdone            drpcsignal.Chan      // signals when NewServerStream has registered the new stream
+	serverStreamReqs chan serverStreamReq // new server stream request from manageReader to NewServerStream
+
+	// Below fields are owned by the manageReader goroutine, used in handleInvokeFrame.
+	metadata map[string]string        // accumulated invoke metadata
+	pa       drpcwire.PacketAssembler // assembles invoke/metadata frames into packets
 
 	sigs struct {
 		term   drpcsignal.Signal // set when the manager should start terminating
@@ -87,6 +92,14 @@ type Manager struct {
 		read   drpcsignal.Signal // set after the goroutine reading from the transport is done
 		tport  drpcsignal.Signal // set after the transport has been closed
 	}
+}
+
+// serverStreamReq carries the assembled invoke data from manageReader to
+// NewServerStream. It is reused across invocations; call Reset between uses.
+type serverStreamReq struct {
+	sid      uint64
+	metadata map[string]string
+	data     []byte // RPC name bytes from the KindInvoke packet
 }
 
 type streamInfo struct {
@@ -108,7 +121,8 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 		rd:   drpcwire.NewReaderWithOptions(tr, opts.Reader),
 		opts: opts,
 
-		pkts:    make(chan drpcwire.Packet),
+		serverStreamReqs: make(chan serverStreamReq),
+
 		sfin:    make(chan struct{}, 1),
 		streams: make(chan streamInfo),
 	}
@@ -119,9 +133,10 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 	// this semaphore controls the number of concurrent streams. it MUST be 1.
 	m.sem.Make(1)
 
-	// a buffer of size 1 allows the consumer of the packet to signal it is done
-	// without having to coordinate with the sender of the packet.
+	// a buffer of size 1 allows NewServerStream to signal it is done creating a
+	// new server stream without having to coordinate with manageReader.
 	m.pdone.Make(1)
+	m.pa = drpcwire.NewPacketAssembler()
 
 	// set the internal stream options
 	drpcopts.SetStreamTransport(&m.opts.Stream.Internal, m.tr)
@@ -256,16 +271,8 @@ func (m *Manager) manageReader() {
 			if curr != nil && !curr.IsTerminated() {
 				curr.Cancel(context.Canceled)
 			}
-
-			pkt := drpcwire.Packet{ID: incomingFrame.ID, Kind: incomingFrame.Kind, Data: incomingFrame.Data}
-			select {
-			case m.pkts <- pkt:
-				// Wait for NewServerStream to finish stream creation (including
-				// sbuf.Set) before reading the next frame. This guarantees curr
-				// is set for subsequent non-invoke packets.
-				m.pdone.Recv()
-
-			case <-m.sigs.term.Signal():
+			if err := m.handleInvokeFrame(incomingFrame); err != nil {
+				m.terminate(managerClosed.Wrap(err))
 				return
 			}
 
@@ -290,6 +297,43 @@ func (m *Manager) checkStreamMonotonicity(incomingFrame drpcwire.Frame) bool {
 		m.lastFrameID.Message += 1
 	}
 	return ok
+}
+
+// handleInvokeFrame assembles invoke/metadata frames into complete packets and
+// forwards the finished invoke info to NewServerStream via m.newServerStreamInfo.
+// Metadata packets are accumulated; the invoke packet triggers the send.
+func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
+	pkt, packetReady, err := m.pa.AppendFrame(fr)
+	if err != nil {
+		return err
+	}
+	if !packetReady {
+		return nil
+	}
+
+	// Metadata arrives before invoke; accumulate it and wait for the invoke.
+	if pkt.Kind == drpcwire.KindInvokeMetadata {
+		meta, err := drpcmetadata.Decode(pkt.Data)
+		if err != nil {
+			return err
+		}
+		m.metadata = meta
+		return nil
+	}
+
+	// Invoke packet completes the sequence. Send to NewServerStream.
+	select {
+	case m.serverStreamReqs <- serverStreamReq{sid: pkt.ID.Stream, data: pkt.Data, metadata: m.metadata}:
+		// Wait for NewServerStream to finish stream creation (including
+		// sbuf.Set) before reading the next frame. This guarantees curr
+		// is set for subsequent non-invoke packets.
+		m.pdone.Recv()
+
+		m.pa.Reset()
+		m.metadata = nil
+	case <-m.sigs.term.Signal():
+	}
+	return nil
 }
 
 //
@@ -451,8 +495,6 @@ func (m *Manager) NewServerStream(
 		}
 	}()
 
-	var meta map[string]string
-	var metaID uint64
 	var timeoutCh <-chan time.Time
 
 	// set up the timeout on the context if necessary.
@@ -462,80 +504,40 @@ func (m *Manager) NewServerStream(
 		timeoutCh = timer.C
 	}
 
-	for {
-		select {
-		case <-timeoutCh:
-			return nil, "", context.DeadlineExceeded
+	select {
+	case <-timeoutCh:
+		return nil, "", context.DeadlineExceeded
 
-		case <-ctx.Done():
-			return nil, "", ctx.Err()
+	case <-ctx.Done():
+		return nil, "", ctx.Err()
 
-		case <-m.sigs.term.Signal():
-			return nil, "", m.sigs.term.Err()
+	case <-m.sigs.term.Signal():
+		return nil, "", m.sigs.term.Err()
 
-		case pkt := <-m.pkts:
-			var s *drpcstream.Stream
-			ctx, s, rpc, err = m.handleInvokePacket(ctx, pkt, &meta, &metaID)
-			if err != nil || s != nil {
-				return s, rpc, err
-			}
-		}
-	}
-}
-
-// handleInvokePacket processes a KindInvokeMetadata or KindInvoke packet
-// received during NewServerStream. It updates the accumulated metadata state
-// via the meta and metaID pointers. When a KindInvoke packet is processed, it
-// creates a new server stream and returns it as the second return value; the
-// caller should return in that case. Otherwise a nil stream is returned and the
-// caller should continue waiting for the next packet.
-func (m *Manager) handleInvokePacket(
-	ctx context.Context, pkt drpcwire.Packet, meta *map[string]string, metaID *uint64,
-) (context.Context, *drpcstream.Stream, string, error) {
-	switch pkt.Kind {
-	// keep track of any metadata being sent before an invoke so that we
-	// can include it if the stream id matches the eventual invoke.
-	case drpcwire.KindInvokeMetadata:
-		var err error
-		*meta, err = drpcmetadata.Decode(pkt.Data)
-		m.pdone.Send()
-
-		if err != nil {
-			return ctx, nil, "", err
-		}
-		*metaID = pkt.ID.Stream
-		return ctx, nil, "", nil
-
-	case drpcwire.KindInvoke:
-		rpc := string(pkt.Data)
-
-		if *metaID == pkt.ID.Stream {
+	case pkt := <-m.serverStreamReqs:
+		rpc = string(pkt.data)
+		if pkt.metadata != nil {
 			if m.opts.GRPCMetadataCompatMode {
 				// Populate incoming metadata as grpc metadata in the
 				// context. This is a short-term fix that will enable us
 				// to send and receive grpc metadata when DRPC is enabled,
 				// without any changes in the calling code.
-				grpcMeta := make(map[string][]string, len(*meta))
-				for k, v := range *meta {
+				grpcMeta := make(map[string][]string, len(pkt.metadata))
+				for k, v := range pkt.metadata {
 					grpcMeta[k] = []string{v}
 				}
 				ctx = grpcmetadata.NewIncomingContext(ctx, grpcMeta)
 			} else {
 				// Add metadata to the incoming context.
-				ctx = drpcmetadata.NewIncomingContext(ctx, *meta)
+				ctx = drpcmetadata.NewIncomingContext(ctx, pkt.metadata)
 			}
 		}
-		stream, err := m.newStream(ctx, pkt.ID.Stream, drpc.StreamKindServer, rpc)
+		stream, err := m.newStream(ctx, pkt.sid, drpc.StreamKindServer, rpc)
 		// Signal pdone only after stream registration so that
 		// manageReader sees the new stream via sbuf.Get() when it reads
 		// the next frame.
 		m.pdone.Send()
-		return ctx, stream, rpc, err
-
-	default:
-		// this should never happen, but defensive.
-		m.pdone.Send()
-		return ctx, nil, "", nil
+		return stream, rpc, err
 	}
 }
 
