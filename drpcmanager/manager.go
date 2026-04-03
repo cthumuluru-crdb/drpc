@@ -15,7 +15,6 @@ import (
 
 	"github.com/zeebo/errs"
 	grpcmetadata "google.golang.org/grpc/metadata"
-
 	"storj.io/drpc"
 	"storj.io/drpc/drpcdebug"
 	"storj.io/drpc/drpcmetadata"
@@ -298,7 +297,9 @@ func (m *Manager) checkStreamMonotonicity(incomingFrame drpcwire.Frame) bool {
 //
 
 // newStream creates a stream value with the appropriate configuration for this manager.
-func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKind, rpc string) (*drpcstream.Stream, error) {
+func (m *Manager) newStream(
+	ctx context.Context, sid uint64, kind drpc.StreamKind, rpc string,
+) (*drpcstream.Stream, error) {
 	opts := m.opts.Stream
 	drpcopts.SetStreamKind(&opts.Internal, kind)
 	drpcopts.SetStreamRPC(&opts.Internal, rpc)
@@ -425,7 +426,9 @@ func (m *Manager) Close() error {
 }
 
 // NewClientStream starts a stream on the managed transport for use by a client.
-func (m *Manager) NewClientStream(ctx context.Context, rpc string) (stream *drpcstream.Stream, err error) {
+func (m *Manager) NewClientStream(
+	ctx context.Context, rpc string,
+) (stream *drpcstream.Stream, err error) {
 	if err := m.acquireSemaphore(ctx); err != nil {
 		return nil, err
 	}
@@ -436,7 +439,9 @@ func (m *Manager) NewClientStream(ctx context.Context, rpc string) (stream *drpc
 // NewServerStream starts a stream on the managed transport for use by a server.
 // It does this by waiting for the client to issue an invoke message and
 // returning the details.
-func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Stream, rpc string, err error) {
+func (m *Manager) NewServerStream(
+	ctx context.Context,
+) (stream *drpcstream.Stream, rpc string, err error) {
 	if err := m.acquireSemaphore(ctx); err != nil {
 		return nil, "", err
 	}
@@ -469,49 +474,68 @@ func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Strea
 			return nil, "", m.sigs.term.Err()
 
 		case pkt := <-m.pkts:
-			switch pkt.Kind {
-			// keep track of any metadata being sent before an invoke so that we
-			// can include it if the stream id matches the eventual invoke.
-			case drpcwire.KindInvokeMetadata:
-				meta, err = drpcmetadata.Decode(pkt.Data)
-				m.pdone.Send()
-
-				if err != nil {
-					return nil, "", err
-				}
-				metaID = pkt.ID.Stream
-
-			case drpcwire.KindInvoke:
-				rpc = string(pkt.Data)
-
-				if metaID == pkt.ID.Stream {
-					if m.opts.GRPCMetadataCompatMode {
-						// Populate incoming metadata as grpc metadata in the
-						// context. This is a short-term fix that will enable us
-						// to send and receive grpc metadata when DRPC is enabled,
-						// without any changes in the calling code.
-						grpcMeta := make(map[string][]string, len(meta))
-						for k, v := range meta {
-							grpcMeta[k] = []string{v}
-						}
-						ctx = grpcmetadata.NewIncomingContext(ctx, grpcMeta)
-					} else {
-						// Add metadata to the incoming context.
-						ctx = drpcmetadata.NewIncomingContext(ctx, meta)
-					}
-				}
-				stream, err := m.newStream(ctx, pkt.ID.Stream, drpc.StreamKindServer, rpc)
-				// Signal pdone only after stream registration so that
-				// manageReader sees the new stream via sbuf.Get() when it reads
-				// the next frame.
-				m.pdone.Send()
-				return stream, rpc, err
-
-			default:
-				// this should never happen, but defensive.
-				m.pdone.Send()
+			var s *drpcstream.Stream
+			ctx, s, rpc, err = m.handleInvokePacket(ctx, pkt, &meta, &metaID)
+			if err != nil || s != nil {
+				return s, rpc, err
 			}
 		}
+	}
+}
+
+// handleInvokePacket processes a KindInvokeMetadata or KindInvoke packet
+// received during NewServerStream. It updates the accumulated metadata state
+// via the meta and metaID pointers. When a KindInvoke packet is processed, it
+// creates a new server stream and returns it as the second return value; the
+// caller should return in that case. Otherwise a nil stream is returned and the
+// caller should continue waiting for the next packet.
+func (m *Manager) handleInvokePacket(
+	ctx context.Context, pkt drpcwire.Packet, meta *map[string]string, metaID *uint64,
+) (context.Context, *drpcstream.Stream, string, error) {
+	switch pkt.Kind {
+	// keep track of any metadata being sent before an invoke so that we
+	// can include it if the stream id matches the eventual invoke.
+	case drpcwire.KindInvokeMetadata:
+		var err error
+		*meta, err = drpcmetadata.Decode(pkt.Data)
+		m.pdone.Send()
+
+		if err != nil {
+			return ctx, nil, "", err
+		}
+		*metaID = pkt.ID.Stream
+		return ctx, nil, "", nil
+
+	case drpcwire.KindInvoke:
+		rpc := string(pkt.Data)
+
+		if *metaID == pkt.ID.Stream {
+			if m.opts.GRPCMetadataCompatMode {
+				// Populate incoming metadata as grpc metadata in the
+				// context. This is a short-term fix that will enable us
+				// to send and receive grpc metadata when DRPC is enabled,
+				// without any changes in the calling code.
+				grpcMeta := make(map[string][]string, len(*meta))
+				for k, v := range *meta {
+					grpcMeta[k] = []string{v}
+				}
+				ctx = grpcmetadata.NewIncomingContext(ctx, grpcMeta)
+			} else {
+				// Add metadata to the incoming context.
+				ctx = drpcmetadata.NewIncomingContext(ctx, *meta)
+			}
+		}
+		stream, err := m.newStream(ctx, pkt.ID.Stream, drpc.StreamKindServer, rpc)
+		// Signal pdone only after stream registration so that
+		// manageReader sees the new stream via sbuf.Get() when it reads
+		// the next frame.
+		m.pdone.Send()
+		return ctx, stream, rpc, err
+
+	default:
+		// this should never happen, but defensive.
+		m.pdone.Send()
+		return ctx, nil, "", nil
 	}
 }
 
