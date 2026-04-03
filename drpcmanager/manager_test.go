@@ -364,9 +364,10 @@ func TestManageReader_OldStreamFramesIgnored(t *testing.T) {
 	_ = stream2.Close()
 }
 
-// The first frame for a new stream must be KindInvoke or KindInvokeMetadata.
-// A non-invoke kind causes a protocol error.
-func TestManageReader_FirstFrameMustBeInvoke(t *testing.T) {
+// Non-invoke frames with no active stream are silently dropped, matching gRPC
+// behavior. This covers both the case where a frame arrives before any stream
+// is created and the case where a stream was removed.
+func TestManageReader_NonInvokeWithNoStreamIgnored(t *testing.T) {
 	for _, kind := range []drpcwire.Kind{
 		drpcwire.KindMessage,
 		drpcwire.KindCancel,
@@ -375,6 +376,9 @@ func TestManageReader_FirstFrameMustBeInvoke(t *testing.T) {
 		drpcwire.KindError,
 	} {
 		t.Run(kind.String(), func(t *testing.T) {
+			ctx := drpctest.NewTracker(t)
+			defer ctx.Close()
+
 			cconn, sconn := net.Pipe()
 			defer func() { _ = cconn.Close() }()
 			defer func() { _ = sconn.Close() }()
@@ -382,11 +386,29 @@ func TestManageReader_FirstFrameMustBeInvoke(t *testing.T) {
 			man := New(sconn)
 			defer func() { _ = man.Close() }()
 
+			// Send a non-invoke frame with no active stream.
+			// It should be silently ignored.
 			writeFrames(t, cconn,
 				createFrame(kind, 1, 1, "", true),
 			)
 
-			waitForClosed(t, man)
+			// Follow up with a valid invoke. If the manager
+			// terminated on the earlier frame, this would fail.
+			recv := make(chan []byte, 1)
+			ctx.Run(func(ctx context.Context) {
+				stream, _, err := man.NewServerStream(ctx)
+				assert.NoError(t, err)
+				data, err := stream.RawRecv()
+				assert.NoError(t, err)
+				recv <- data
+			})
+
+			writeFrames(t, cconn,
+				createFrame(drpcwire.KindInvoke, 2, 1, "rpc", true),
+				createFrame(drpcwire.KindMessage, 2, 2, "hello", true),
+			)
+
+			assert.DeepEqual(t, <-recv, []byte("hello"))
 		})
 	}
 }
@@ -614,6 +636,76 @@ func TestManageReader_WaitsForStreamCreation(t *testing.T) {
 	})
 
 	assert.DeepEqual(t, <-recv, []byte("data"))
+}
+
+// When a server stream's context is canceled, manageStream removes the stream
+// from the active registry. Any in-flight frames for that stream that arrive
+// after removal should be silently dropped, not terminate the connection. This
+// reproduces the scenario that caused flaky ambiguous-result errors in
+// CockroachDB when DRPC was enabled.
+func TestManageReader_LateFrameAfterStreamRemoved(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	sman := NewWithOptions(sconn, Options{SoftCancel: true})
+	defer func() { _ = sman.Close() }()
+
+	// Drain client-side writes so the server manager doesn't block.
+	ctx.Run(func(ctx context.Context) {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := cconn.Read(buf); err != nil {
+				return
+			}
+		}
+	})
+
+	// Send invoke for stream 1 and create a server stream with a
+	// cancelable context.
+	writeFrames(t, cconn,
+		createFrame(drpcwire.KindInvoke, 1, 1, "rpc1", true),
+	)
+
+	subctx, cancel := context.WithCancel(ctx)
+	stream1, _, err := sman.NewServerStream(subctx)
+	assert.NoError(t, err)
+	_ = stream1
+
+	// Cancel the server stream's context. This triggers manageStream to
+	// call active.Remove(), leaving no active stream in the registry.
+	cancel()
+
+	// Wait for the stream to be fully removed from the registry.
+	<-sman.Unblocked()
+
+	// Send a late non-invoke frame for stream 1. With the old (broken)
+	// behavior this would terminate the connection. Now it should be
+	// silently dropped.
+	writeFrames(t, cconn,
+		createFrame(drpcwire.KindCloseSend, 1, 2, "", true),
+	)
+
+	// Verify the manager is still alive by successfully creating a new
+	// stream for a subsequent invoke.
+	recv := make(chan []byte, 1)
+	ctx.Run(func(ctx context.Context) {
+		stream2, _, err := sman.NewServerStream(ctx)
+		assert.NoError(t, err)
+		data, err := stream2.RawRecv()
+		assert.NoError(t, err)
+		recv <- data
+	})
+
+	writeFrames(t, cconn,
+		createFrame(drpcwire.KindInvoke, 2, 1, "rpc2", true),
+		createFrame(drpcwire.KindMessage, 2, 2, "alive", true),
+	)
+
+	assert.DeepEqual(t, <-recv, []byte("alive"))
 }
 
 type blockingTransport chan struct{}

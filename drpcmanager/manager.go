@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"strings"
 	"sync"
@@ -81,10 +80,11 @@ type Manager struct {
 
 	wg sync.WaitGroup // tracks active manageStream goroutines
 
-	// reg tracks active streams. Currently holds at most one active stream;
-	// a second may briefly coexist during stream handoff (old stream's
-	// Unregister races with new stream's Register).
-	reg *streamRegistry
+	// active tracks active streams. Currently holds at most one active
+	// stream; a second may briefly coexist during stream handoff (old
+	// stream's Remove races with new stream's Add). It checks sigs.term
+	// atomically with Add to prevent TOCTOU races.
+	active *activeStreams
 
 	sem  drpcsignal.Chan // held by the active stream
 	sfin chan struct{}   // shared signal for stream finished
@@ -137,7 +137,7 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 	// new server stream without having to coordinate with manageReader.
 	m.pdone.Make(1)
 	m.pa = drpcwire.NewPacketAssembler()
-	m.reg = newStreamRegistry()
+	m.active = newActiveStreams(&m.sigs.term, &m.sigs.tport)
 
 	// set the internal stream options
 	drpcopts.SetStreamTransport(&m.opts.Stream.Internal, m.tr)
@@ -191,7 +191,7 @@ func (m *Manager) acquireSemaphore(ctx context.Context) error {
 // longer make any reads or writes on the transport. It exits early if the
 // context is canceled or the manager is terminated.
 func (m *Manager) waitForPreviousStream(ctx context.Context) (err error) {
-	prev := m.reg.GetLatest()
+	prev := m.active.Latest()
 	if prev == nil {
 		return nil
 	}
@@ -222,7 +222,7 @@ func (m *Manager) terminate(err error) {
 	if m.sigs.term.Set(err) {
 		m.log("TERM", func() string { return fmt.Sprint(err) })
 		m.sigs.tport.Set(m.tr.Close())
-		m.reg.Close()
+		m.active.Close(err)
 	}
 }
 
@@ -254,7 +254,7 @@ func (m *Manager) manageReader() {
 			return
 		}
 
-		switch curr := m.reg.GetLatest(); {
+		switch curr := m.active.Latest(); {
 		// If the frame is for the current stream, deliver it.
 		case curr != nil && incomingFrame.ID.Stream == curr.ID():
 			if err := curr.HandleFrame(incomingFrame); err != nil {
@@ -277,7 +277,10 @@ func (m *Manager) manageReader() {
 			}
 
 		default:
-			m.log("DROP", incomingFrame.String)
+			// A non-invoke frame arrived with no active stream to deliver it
+			// to. This can happen when a stream is removed (e.g. context
+			// canceled) while frames are still in flight. Silently ignore
+			// them.
 		}
 	}
 }
@@ -345,8 +348,7 @@ func (m *Manager) newStream(
 	}
 
 	stream := drpcstream.NewWithOptions(ctx, sid, m.wr, opts)
-
-	if err := m.reg.Register(sid, stream); err != nil {
+	if err := m.active.Add(sid, stream); err != nil {
 		return nil, err
 	}
 
@@ -362,20 +364,8 @@ func (m *Manager) newStream(
 // is finished, canceling the stream if the context is canceled.
 func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
 	defer m.wg.Done()
-	defer m.reg.Unregister(stream.ID())
+	defer m.active.Remove(stream.ID())
 	select {
-	case <-m.sigs.term.Signal():
-		err := m.sigs.term.Err()
-		if errors.Is(err, io.EOF) {
-			err = context.Canceled
-			if stream.Kind() == drpc.StreamKindClient {
-				err = drpc.ClosedError.New("connection closed")
-			}
-		}
-		stream.Cancel(err)
-		<-m.sfin
-		m.sem.Recv()
-
 	case <-m.sfin:
 		m.sem.Recv()
 
@@ -433,7 +423,7 @@ func (m *Manager) Closed() <-chan struct{} {
 // the return result is only valid until the next call to NewClientStream or
 // NewServerStream.
 func (m *Manager) Unblocked() <-chan struct{} {
-	if prev := m.reg.GetLatest(); prev != nil {
+	if prev := m.active.Latest(); prev != nil {
 		return prev.Context().Done()
 	}
 	return closedCh

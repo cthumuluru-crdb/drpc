@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/zeebo/assert"
-
 	"storj.io/drpc/drpcstream"
 	"storj.io/drpc/drpcwire"
 )
@@ -17,118 +16,163 @@ func testStream(id uint64) *drpcstream.Stream {
 	return drpcstream.New(context.Background(), id, &drpcwire.Writer{})
 }
 
-func TestStreamRegistry_RegisterAndGet(t *testing.T) {
-	reg := newStreamRegistry()
+// testActiveStreams returns an activeStreams with fresh term and tport signals.
+func testActiveStreams() (*activeStreams, *Manager) {
+	m := &Manager{}
+	m.active = newActiveStreams(&m.sigs.term, &m.sigs.tport)
+	return m.active, m
+}
+
+func TestActiveStreams_AddAndLatest(t *testing.T) {
+	a, _ := testActiveStreams()
 	s := testStream(1)
 
-	assert.NoError(t, reg.Register(1, s))
+	assert.NoError(t, a.Add(1, s))
 
-	got, ok := reg.Get(1)
-	assert.That(t, ok)
+	got := a.Latest()
 	assert.Equal(t, got, s)
 }
 
-func TestStreamRegistry_GetMissing(t *testing.T) {
-	reg := newStreamRegistry()
-
-	got, ok := reg.Get(42)
-	assert.That(t, !ok)
-	assert.Nil(t, got)
-}
-
-func TestStreamRegistry_Unregister(t *testing.T) {
-	reg := newStreamRegistry()
+func TestActiveStreams_Remove(t *testing.T) {
+	a, _ := testActiveStreams()
 	s := testStream(1)
 
-	assert.NoError(t, reg.Register(1, s))
-	assert.Equal(t, reg.Len(), 1)
+	assert.NoError(t, a.Add(1, s))
+	assert.That(t, a.Latest() != nil)
 
-	reg.Unregister(1)
+	a.Remove(1)
 
-	_, ok := reg.Get(1)
-	assert.That(t, !ok)
-	assert.Equal(t, reg.Len(), 0)
+	assert.Nil(t, a.Latest())
 }
 
-func TestStreamRegistry_UnregisterIdempotent(t *testing.T) {
-	reg := newStreamRegistry()
+func TestActiveStreams_RemoveIdempotent(t *testing.T) {
+	a, _ := testActiveStreams()
 
-	// must not panic when unregistering a non-existent ID
-	reg.Unregister(99)
+	// must not panic when removing a non-existent ID
+	a.Remove(99)
 }
 
-func TestStreamRegistry_DuplicateRegister(t *testing.T) {
-	reg := newStreamRegistry()
+func TestActiveStreams_DuplicateAdd(t *testing.T) {
+	a, _ := testActiveStreams()
 	s1 := testStream(1)
 	s2 := testStream(1)
 
-	assert.NoError(t, reg.Register(1, s1))
-	assert.Error(t, reg.Register(1, s2))
+	assert.NoError(t, a.Add(1, s1))
+	assert.Error(t, a.Add(1, s2))
 
-	// original stream is still registered
-	got, ok := reg.Get(1)
-	assert.That(t, ok)
+	// original stream is still present
+	got := a.Latest()
 	assert.Equal(t, got, s1)
 }
 
-func TestStreamRegistry_RegisterAfterClose(t *testing.T) {
-	reg := newStreamRegistry()
-	reg.Close()
+func TestActiveStreams_AddAfterTerminate(t *testing.T) {
+	a, m := testActiveStreams()
+	m.sigs.term.Set(managerClosed.New("test"))
 
-	err := reg.Register(1, testStream(1))
+	err := a.Add(1, testStream(1))
 	assert.Error(t, err)
 }
 
-func TestStreamRegistry_UnregisterAfterClose(t *testing.T) {
-	reg := newStreamRegistry()
+func TestActiveStreams_RemoveAfterTerminate(t *testing.T) {
+	a, m := testActiveStreams()
 	s := testStream(1)
-	assert.NoError(t, reg.Register(1, s))
+	assert.NoError(t, a.Add(1, s))
 
-	reg.Close()
+	m.sigs.term.Set(managerClosed.New("test"))
 
 	// must not panic
-	reg.Unregister(1)
+	a.Remove(1)
 }
 
-func TestStreamRegistry_Len(t *testing.T) {
-	reg := newStreamRegistry()
-	assert.Equal(t, reg.Len(), 0)
-
-	assert.NoError(t, reg.Register(1, testStream(1)))
-	assert.Equal(t, reg.Len(), 1)
-
-	assert.NoError(t, reg.Register(2, testStream(2)))
-	assert.Equal(t, reg.Len(), 2)
-
-	reg.Unregister(1)
-	assert.Equal(t, reg.Len(), 1)
-}
-
-func TestStreamRegistry_ForEach(t *testing.T) {
-	reg := newStreamRegistry()
+func TestActiveStreams_LatestTracksNewest(t *testing.T) {
+	a, _ := testActiveStreams()
 	s1 := testStream(1)
 	s2 := testStream(2)
-	s3 := testStream(3)
 
-	assert.NoError(t, reg.Register(1, s1))
-	assert.NoError(t, reg.Register(2, s2))
-	assert.NoError(t, reg.Register(3, s3))
+	assert.NoError(t, a.Add(1, s1))
+	assert.Equal(t, a.Latest(), s1)
 
-	seen := make(map[uint64]*drpcstream.Stream)
-	reg.ForEach(func(s *drpcstream.Stream) {
-		seen[s.ID()] = s
-	})
+	assert.NoError(t, a.Add(2, s2))
+	assert.Equal(t, a.Latest(), s2)
 
-	assert.Equal(t, len(seen), 3)
-	assert.Equal(t, seen[1], s1)
-	assert.Equal(t, seen[2], s2)
-	assert.Equal(t, seen[3], s3)
+	// Removing the old stream doesn't affect Latest.
+	a.Remove(1)
+	assert.Equal(t, a.Latest(), s2)
 }
 
-func TestStreamRegistry_ForEach_Empty(t *testing.T) {
-	reg := newStreamRegistry()
+func TestActiveStreams_EmptyLatest(t *testing.T) {
+	a, _ := testActiveStreams()
+	assert.Nil(t, a.Latest())
+}
 
-	count := 0
-	reg.ForEach(func(_ *drpcstream.Stream) { count++ })
-	assert.Equal(t, count, 0)
+func TestActiveStreams_Get(t *testing.T) {
+	a, _ := testActiveStreams()
+	s := testStream(1)
+
+	assert.NoError(t, a.Add(1, s))
+
+	got, ok := a.Get(1)
+	assert.That(t, ok)
+	assert.Equal(t, got, s)
+
+	_, ok = a.Get(99)
+	assert.That(t, !ok)
+}
+
+func TestActiveStreams_Len(t *testing.T) {
+	a, _ := testActiveStreams()
+	assert.Equal(t, a.Len(), 0)
+
+	assert.NoError(t, a.Add(1, testStream(1)))
+	assert.Equal(t, a.Len(), 1)
+
+	assert.NoError(t, a.Add(2, testStream(2)))
+	assert.Equal(t, a.Len(), 2)
+
+	a.Remove(1)
+	assert.Equal(t, a.Len(), 1)
+}
+
+func TestActiveStreams_Close(t *testing.T) {
+	a, m := testActiveStreams()
+	s1 := testStream(1)
+	s2 := testStream(2)
+
+	assert.NoError(t, a.Add(1, s1))
+	assert.NoError(t, a.Add(2, s2))
+
+	m.sigs.term.Set(managerClosed.New("test"))
+	m.sigs.tport.Set(nil)
+	a.Close(context.Canceled)
+
+	// All streams are canceled.
+	assert.That(t, s1.IsTerminated())
+	assert.That(t, s2.IsTerminated())
+
+	// Map is cleared.
+	assert.Equal(t, a.Len(), 0)
+	assert.Nil(t, a.Latest())
+}
+
+func TestActiveStreams_RemoveAfterClose(t *testing.T) {
+	a, m := testActiveStreams()
+	assert.NoError(t, a.Add(1, testStream(1)))
+
+	m.sigs.term.Set(managerClosed.New("test"))
+	m.sigs.tport.Set(nil)
+	a.Close(context.Canceled)
+
+	// must not panic
+	a.Remove(1)
+}
+
+func TestActiveStreams_ClosePanicsWithoutTransportClose(t *testing.T) {
+	a, _ := testActiveStreams()
+
+	defer func() {
+		r := recover()
+		assert.That(t, r != nil)
+	}()
+
+	a.Close(context.Canceled)
 }

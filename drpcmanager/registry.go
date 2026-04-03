@@ -4,106 +4,117 @@
 package drpcmanager
 
 import (
+	"context"
+	"errors"
+	"io"
 	"sync"
 
+	"storj.io/drpc"
+	"storj.io/drpc/drpcsignal"
 	"storj.io/drpc/drpcstream"
 )
 
-// streamRegistry is a thread-safe map of stream IDs to stream objects.
-// It is used by the Manager to track active streams for lifecycle management.
-type streamRegistry struct {
+// activeStreams is a thread-safe map of stream IDs to stream objects. It
+// checks the provided termination signal atomically with Add to prevent
+// streams from being added on a terminated manager.
+type activeStreams struct {
 	mu      sync.RWMutex
 	streams map[uint64]*drpcstream.Stream
-	closed  bool
+	// latestID tracks the highest stream ID that's active.
+	//
+	// NB: This will be removed once stream multiplexing implementation is
+	// complete. Only used for backwards compatibility.
+	latestID uint64
+	term     *drpcsignal.Signal
+	tport    *drpcsignal.Signal
 }
 
-func newStreamRegistry() *streamRegistry {
-	return &streamRegistry{
+func newActiveStreams(term, tport *drpcsignal.Signal) *activeStreams {
+	return &activeStreams{
 		streams: make(map[uint64]*drpcstream.Stream),
+		term:    term,
+		tport:   tport,
 	}
 }
 
-// Register adds a stream to the registry. It returns an error if the registry
-// is closed or if a stream with the same ID is already registered.
-func (r *streamRegistry) Register(id uint64, stream *drpcstream.Stream) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+// Add adds a stream. It returns an error if the manager is terminated or if
+// a stream with the same ID already exists.
+func (a *activeStreams) Add(id uint64, stream *drpcstream.Stream) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
-	if stream == nil {
-		return managerClosed.New("stream can't be nil")
+	if err, ok := a.term.Get(); ok {
+		return err
 	}
+	if _, ok := a.streams[id]; ok {
+		return drpc.ProtocolError.New("duplicate stream id %d", id)
+	}
+	a.streams[id] = stream
+	// NB: Only one active stream is supported, so we can just track the latest ID.
+	a.latestID = id
 
-	if r.closed {
-		return managerClosed.New("register")
-	}
-	if _, ok := r.streams[id]; ok {
-		return managerClosed.New("duplicate stream id")
-	}
-	r.streams[id] = stream
 	return nil
 }
 
-// Unregister removes a stream from the registry. It is a no-op if the stream
-// is not registered or if the registry has been closed.
-func (r *streamRegistry) Unregister(id uint64) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+// Remove removes a stream by ID.
+func (a *activeStreams) Remove(id uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
-	if r.streams != nil {
-		delete(r.streams, id)
-	}
+	delete(a.streams, id)
 }
 
 // Get returns the stream for the given ID and whether it was found.
-func (r *streamRegistry) Get(id uint64) (*drpcstream.Stream, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+func (a *activeStreams) Get(id uint64) (*drpcstream.Stream, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 
-	s, ok := r.streams[id]
+	s, ok := a.streams[id]
 	return s, ok
 }
 
-// GetLatest returns the stream with the highest ID, or nil if the registry is
-// empty. It iterates the map because the registry may briefly hold two streams
-// during stream handoff. This method should be removed once multiplexing is
-// supported and callers look up streams by ID directly.
-func (r *streamRegistry) GetLatest() *drpcstream.Stream {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+// Latest returns the stream with the highest ID, or nil if empty.
+func (a *activeStreams) Latest() *drpcstream.Stream {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 
-	var latest *drpcstream.Stream
-	for _, s := range r.streams {
-		if latest == nil || latest.ID() < s.ID() {
-			latest = s
+	return a.streams[a.latestID]
+}
+
+// Len returns the number of active streams.
+func (a *activeStreams) Len() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	return len(a.streams)
+}
+
+// Close cancels all active streams with the provided error and clears the map.
+// After Close, Add will fail (term signal is already set by the caller), and
+// Remove is a safe no-op.
+func (a *activeStreams) Close(err error) {
+	if !a.tport.IsSet() {
+		panic("activeStreams.Close called before transport was closed")
+	}
+
+	var streams map[uint64]*drpcstream.Stream
+	func() {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+
+		streams = a.streams
+		a.streams = make(map[uint64]*drpcstream.Stream)
+		a.latestID = 0
+	}()
+
+	for _, s := range streams {
+		e := err
+		if errors.Is(err, io.EOF) {
+			e = context.Canceled
+			if s.Kind() == drpc.StreamKindClient {
+				e = drpc.ClosedError.New("connection closed")
+			}
 		}
+		s.Cancel(e)
 	}
-	return latest
-}
-
-// Close marks the registry as closed, preventing future Register calls.
-// It does not cancel any streams.
-func (r *streamRegistry) Close() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.closed = true
-}
-
-// ForEach calls fn for each registered stream. The registry is read-locked
-// during iteration.
-func (r *streamRegistry) ForEach(fn func(*drpcstream.Stream)) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	for _, s := range r.streams {
-		fn(s)
-	}
-}
-
-// Len returns the number of registered streams.
-func (r *streamRegistry) Len() int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	return len(r.streams)
 }
