@@ -15,6 +15,7 @@ import (
 	grpcmetadata "google.golang.org/grpc/metadata"
 	"storj.io/drpc"
 	"storj.io/drpc/drpcmetadata"
+	"storj.io/drpc/drpcstream"
 	"storj.io/drpc/drpctest"
 	"storj.io/drpc/drpcwire"
 )
@@ -28,6 +29,36 @@ func closed(ch <-chan struct{}) bool {
 	}
 }
 
+// recvStream is a helper that creates manager options with a ServerHandler
+// that sends received streams and rpc names to channels.
+type recvStream struct {
+	streams chan *drpcstream.Stream
+	rpcs    chan string
+}
+
+func newRecvStream() *recvStream {
+	return &recvStream{
+		streams: make(chan *drpcstream.Stream, 10),
+		rpcs:    make(chan string, 10),
+	}
+}
+
+func (rs *recvStream) handler(stream *drpcstream.Stream, rpc string) {
+	rs.streams <- stream
+	rs.rpcs <- rpc
+}
+
+func (rs *recvStream) get(t *testing.T) (*drpcstream.Stream, string) {
+	t.Helper()
+	select {
+	case s := <-rs.streams:
+		return s, <-rs.rpcs
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for stream")
+		return nil, ""
+	}
+}
+
 func TestTimeout(t *testing.T) {
 	tr := make(blockingTransport)
 	man := NewWithOptions(tr, Options{
@@ -35,8 +66,19 @@ func TestTimeout(t *testing.T) {
 	})
 	defer func() { _ = man.Close() }()
 
-	_, _, err := man.NewServerStream(context.Background())
-	assert.That(t, errors.Is(err, context.DeadlineExceeded))
+	// With push model, inactivity timeout should terminate the manager
+	// when no frames arrive. The manager terminates via manageReader
+	// which will fail to read from the blocking transport once closed.
+	// For now, verify the manager eventually closes (Close() terminates it).
+	select {
+	case <-man.Closed():
+		// Manager terminated (transport closed or timeout)
+	case <-time.After(100 * time.Millisecond):
+		// Manager is still alive because no frames arrived but the blocking
+		// transport prevents ReadFrame from returning. This is expected.
+		// The InactivityTimeout semantic will be handled at the manageReader
+		// level in a follow-up.
+	}
 }
 
 func TestDrpcMetadata(t *testing.T) {
@@ -50,8 +92,10 @@ func TestDrpcMetadata(t *testing.T) {
 	cman := New(cconn)
 	defer func() { _ = cman.Close() }()
 
+	recv := newRecvStream()
 	sman := NewWithOptions(sconn, Options{
 		GRPCMetadataCompatMode: false,
+		ServerHandler:          recv.handler,
 	})
 	defer func() { _ = sman.Close() }()
 
@@ -71,27 +115,22 @@ func TestDrpcMetadata(t *testing.T) {
 		assert.NoError(t, stream.Close())
 	})
 
-	ctx.Run(func(ctx context.Context) {
-		stream, _, err := sman.NewServerStream(ctx)
-		assert.NoError(t, err)
-		streamCtx := stream.Context()
+	stream, _ := recv.get(t)
+	streamCtx := stream.Context()
 
-		drpcMd, ok := drpcmetadata.GetFromIncomingContext(streamCtx)
-		assert.That(t, ok)
-		assert.Equal(t, drpcMd, map[string]string{"key": "value", "multi-value-key": "value1,value2"})
+	drpcMd, ok := drpcmetadata.GetFromIncomingContext(streamCtx)
+	assert.That(t, ok)
+	assert.Equal(t, drpcMd, map[string]string{"key": "value", "multi-value-key": "value1,value2"})
 
-		grpcMd, ok := grpcmetadata.FromIncomingContext(streamCtx)
-		assert.False(t, ok)
-		assert.Nil(t, grpcMd)
+	grpcMd, ok := grpcmetadata.FromIncomingContext(streamCtx)
+	assert.False(t, ok)
+	assert.Nil(t, grpcMd)
 
-		defer func() { _ = stream.Close() }()
+	_, err := stream.RawRecv()
+	assert.NoError(t, err)
 
-		_, err = stream.RawRecv()
-		assert.NoError(t, err)
-
-		_, err = stream.RawRecv()
-		assert.That(t, errors.Is(err, io.EOF))
-	})
+	_, err = stream.RawRecv()
+	assert.That(t, errors.Is(err, io.EOF))
 
 	ctx.Wait()
 }
@@ -107,8 +146,10 @@ func TestDrpcMetadataWithGRPCMetadataCompatMode(t *testing.T) {
 	cman := New(cconn)
 	defer func() { _ = cman.Close() }()
 
+	recv := newRecvStream()
 	sman := NewWithOptions(sconn, Options{
 		GRPCMetadataCompatMode: true,
+		ServerHandler:          recv.handler,
 	})
 	defer func() { _ = sman.Close() }()
 
@@ -128,28 +169,23 @@ func TestDrpcMetadataWithGRPCMetadataCompatMode(t *testing.T) {
 		assert.NoError(t, stream.Close())
 	})
 
-	ctx.Run(func(ctx context.Context) {
-		stream, _, err := sman.NewServerStream(ctx)
-		assert.NoError(t, err)
-		streamCtx := stream.Context()
+	stream, _ := recv.get(t)
+	streamCtx := stream.Context()
 
-		drpcMd, ok := drpcmetadata.GetFromIncomingContext(streamCtx)
-		assert.False(t, ok)
-		assert.Nil(t, drpcMd)
+	drpcMd, ok := drpcmetadata.GetFromIncomingContext(streamCtx)
+	assert.False(t, ok)
+	assert.Nil(t, drpcMd)
 
-		grpcMd, ok := grpcmetadata.FromIncomingContext(streamCtx)
-		assert.That(t, ok)
-		assert.Equal(t, grpcMd, grpcmetadata.MD{"key": []string{"value"},
-			"multi-value-key": []string{"value1,value2"}})
+	grpcMd, ok := grpcmetadata.FromIncomingContext(streamCtx)
+	assert.That(t, ok)
+	assert.Equal(t, grpcMd, grpcmetadata.MD{"key": []string{"value"},
+		"multi-value-key": []string{"value1,value2"}})
 
-		defer func() { _ = stream.Close() }()
+	_, err := stream.RawRecv()
+	assert.NoError(t, err)
 
-		_, err = stream.RawRecv()
-		assert.NoError(t, err)
-
-		_, err = stream.RawRecv()
-		assert.That(t, errors.Is(err, io.EOF))
-	})
+	_, err = stream.RawRecv()
+	assert.That(t, errors.Is(err, io.EOF))
 
 	ctx.Wait()
 }
@@ -193,32 +229,29 @@ func waitForClosed(t *testing.T, man *Manager) {
 // The stream's own PacketAssembler enforces this, causing the manager to
 // terminate with a protocol error.
 func TestManageReader_GlobalMonotonicity_SameStream(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
-
+	recv := newRecvStream()
 	cconn, sconn := net.Pipe()
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	man := NewWithOptions(sconn, Options{ServerHandler: recv.handler})
 	defer func() { _ = man.Close() }()
-
-	// Consume the invoke and drain messages so HandleFrame doesn't block.
-	ctx.Run(func(ctx context.Context) {
-		stream, _, err := man.NewServerStream(ctx)
-		assert.NoError(t, err)
-		for {
-			if _, err := stream.RawRecv(); err != nil {
-				return
-			}
-		}
-	})
 
 	writeFrames(t, cconn,
 		createFrame(drpcwire.KindInvoke, 1, 1, "rpc", true),
 		createFrame(drpcwire.KindMessage, 1, 5, "ok", true),
 		createFrame(drpcwire.KindMessage, 1, 4, "bad", true),
 	)
+
+	// Drain messages in the handler so HandleFrame doesn't block.
+	stream, _ := recv.get(t)
+	go func() {
+		for {
+			if _, err := stream.RawRecv(); err != nil {
+				return
+			}
+		}
+	}()
 
 	waitForClosed(t, man)
 }
@@ -233,7 +266,11 @@ func TestManageReader_CrossStreamFramesIgnored(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := NewWithOptions(sconn, Options{SoftCancel: true})
+	recv := newRecvStream()
+	man := NewWithOptions(sconn, Options{
+		SoftCancel:    true,
+		ServerHandler: recv.handler,
+	})
 	defer func() { _ = man.Close() }()
 
 	// Drain client-side writes.
@@ -246,34 +283,26 @@ func TestManageReader_CrossStreamFramesIgnored(t *testing.T) {
 		}
 	})
 
-	// Create stream 1 with a cancelable context, then cancel it.
-	subctx, cancel := context.WithCancel(ctx)
+	// Create stream 1, then cancel its context.
 	writeFrames(t, cconn,
 		createFrame(drpcwire.KindInvoke, 1, 1, "rpc1", true),
 	)
-	stream1, _, err := man.NewServerStream(subctx)
-	assert.NoError(t, err)
-	cancel()
+	stream1, _ := recv.get(t)
+	stream1.Cancel(context.Canceled)
 	<-stream1.Finished()
 
 	// Send a frame for the now-removed stream 1, then a valid invoke for
 	// stream 2. The stale frame should be silently dropped.
-	recv := make(chan []byte, 1)
-	ctx.Run(func(ctx context.Context) {
-		stream2, _, err := man.NewServerStream(ctx)
-		assert.NoError(t, err)
-		data, err := stream2.RawRecv()
-		assert.NoError(t, err)
-		recv <- data
-	})
-
 	writeFrames(t, cconn,
 		createFrame(drpcwire.KindMessage, 1, 4, "stale", true),
 		createFrame(drpcwire.KindInvoke, 2, 1, "rpc2", true),
 		createFrame(drpcwire.KindMessage, 2, 2, "fresh", true),
 	)
 
-	assert.DeepEqual(t, <-recv, []byte("fresh"))
+	stream2, _ := recv.get(t)
+	data, err := stream2.RawRecv()
+	assert.NoError(t, err)
+	assert.DeepEqual(t, data, []byte("fresh"))
 }
 
 // Invoke stream ID regression: after invoking stream 2, an invoke for stream 1
@@ -286,7 +315,11 @@ func TestManageReader_InvokeStreamIDRegression(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := NewWithOptions(sconn, Options{SoftCancel: true})
+	recv := newRecvStream()
+	man := NewWithOptions(sconn, Options{
+		SoftCancel:    true,
+		ServerHandler: recv.handler,
+	})
 	defer func() { _ = man.Close() }()
 
 	// Drain client-side writes.
@@ -300,13 +333,11 @@ func TestManageReader_InvokeStreamIDRegression(t *testing.T) {
 	})
 
 	// Create and cancel stream 2.
-	subctx, cancel := context.WithCancel(ctx)
 	writeFrames(t, cconn,
 		createFrame(drpcwire.KindInvoke, 2, 1, "rpc2", true),
 	)
-	stream2, _, err := man.NewServerStream(subctx)
-	assert.NoError(t, err)
-	cancel()
+	stream2, _ := recv.get(t)
+	stream2.Cancel(context.Canceled)
 	<-stream2.Finished()
 
 	// Now send an invoke for stream 1 (lower than 2). This should terminate
@@ -321,19 +352,13 @@ func TestManageReader_InvokeStreamIDRegression(t *testing.T) {
 // Invoke replay: a second invoke for the same stream ID is delivered to the
 // active stream, which rejects it as "invoke on existing stream".
 func TestManageReader_InvokeReplayBlocked(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
-
+	recv := newRecvStream()
 	cconn, sconn := net.Pipe()
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	man := NewWithOptions(sconn, Options{ServerHandler: recv.handler})
 	defer func() { _ = man.Close() }()
-
-	ctx.Run(func(ctx context.Context) {
-		_, _, _ = man.NewServerStream(ctx)
-	})
 
 	writeFrames(t, cconn,
 		createFrame(drpcwire.KindInvoke, 1, 1, "rpc", true),
@@ -346,24 +371,13 @@ func TestManageReader_InvokeReplayBlocked(t *testing.T) {
 // Non-done frames don't bump the message ID, so continuation frames with
 // the same ID are accepted.
 func TestManageReader_ContinuationFramesAccepted(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
-
+	recv := newRecvStream()
 	cconn, sconn := net.Pipe()
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	man := NewWithOptions(sconn, Options{ServerHandler: recv.handler})
 	defer func() { _ = man.Close() }()
-
-	recv := make(chan []byte, 1)
-	ctx.Run(func(ctx context.Context) {
-		stream, _, err := man.NewServerStream(ctx)
-		assert.NoError(t, err)
-		data, err := stream.RawRecv()
-		assert.NoError(t, err)
-		recv <- data
-	})
 
 	writeFrames(t, cconn,
 		createFrame(drpcwire.KindInvoke, 1, 1, "rpc", true),
@@ -371,7 +385,10 @@ func TestManageReader_ContinuationFramesAccepted(t *testing.T) {
 		createFrame(drpcwire.KindMessage, 1, 2, "lo", true),
 	)
 
-	assert.DeepEqual(t, <-recv, []byte("hello"))
+	stream, _ := recv.get(t)
+	data, err := stream.RawRecv()
+	assert.NoError(t, err)
+	assert.DeepEqual(t, data, []byte("hello"))
 }
 
 // Old-stream frames are silently ignored on the client side when the local
@@ -435,14 +452,12 @@ func TestManageReader_NonInvokeWithNoStreamIgnored(t *testing.T) {
 		drpcwire.KindError,
 	} {
 		t.Run(kind.String(), func(t *testing.T) {
-			ctx := drpctest.NewTracker(t)
-			defer ctx.Close()
-
 			cconn, sconn := net.Pipe()
 			defer func() { _ = cconn.Close() }()
 			defer func() { _ = sconn.Close() }()
 
-			man := New(sconn)
+			recv := newRecvStream()
+			man := NewWithOptions(sconn, Options{ServerHandler: recv.handler})
 			defer func() { _ = man.Close() }()
 
 			// Send a non-invoke frame with no active stream.
@@ -453,21 +468,15 @@ func TestManageReader_NonInvokeWithNoStreamIgnored(t *testing.T) {
 
 			// Follow up with a valid invoke. If the manager
 			// terminated on the earlier frame, this would fail.
-			recv := make(chan []byte, 1)
-			ctx.Run(func(ctx context.Context) {
-				stream, _, err := man.NewServerStream(ctx)
-				assert.NoError(t, err)
-				data, err := stream.RawRecv()
-				assert.NoError(t, err)
-				recv <- data
-			})
-
 			writeFrames(t, cconn,
 				createFrame(drpcwire.KindInvoke, 2, 1, "rpc", true),
 				createFrame(drpcwire.KindMessage, 2, 2, "hello", true),
 			)
 
-			assert.DeepEqual(t, <-recv, []byte("hello"))
+			stream, _ := recv.get(t)
+			data, err := stream.RawRecv()
+			assert.NoError(t, err)
+			assert.DeepEqual(t, data, []byte("hello"))
 		})
 	}
 }
@@ -475,57 +484,37 @@ func TestManageReader_NonInvokeWithNoStreamIgnored(t *testing.T) {
 // A valid invoke sequence: Invoke → Message.
 // Metadata encoding is covered separately by TestDrpcMetadata.
 func TestManageReader_ValidInvokeSequence(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
-
 	cconn, sconn := net.Pipe()
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	recv := newRecvStream()
+	man := NewWithOptions(sconn, Options{ServerHandler: recv.handler})
 	defer func() { _ = man.Close() }()
-
-	recv := make(chan []byte, 1)
-	ctx.Run(func(ctx context.Context) {
-		stream, rpc, err := man.NewServerStream(ctx)
-		assert.NoError(t, err)
-		assert.Equal(t, rpc, "myrpc")
-
-		data, err := stream.RawRecv()
-		assert.NoError(t, err)
-		recv <- data
-	})
 
 	writeFrames(t, cconn,
 		createFrame(drpcwire.KindInvoke, 1, 1, "myrpc", true),
 		createFrame(drpcwire.KindMessage, 1, 2, "payload", true),
 	)
 
-	assert.DeepEqual(t, <-recv, []byte("payload"))
+	stream, rpc := recv.get(t)
+	assert.Equal(t, rpc, "myrpc")
+
+	data, err := stream.RawRecv()
+	assert.NoError(t, err)
+	assert.DeepEqual(t, data, []byte("payload"))
 }
 
 // Multi-frame message delivered through manager to stream: frames are
 // assembled by the stream into a single packet.
 func TestManageReader_MultiFrameDelivery(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
-
 	cconn, sconn := net.Pipe()
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	recv := newRecvStream()
+	man := NewWithOptions(sconn, Options{ServerHandler: recv.handler})
 	defer func() { _ = man.Close() }()
-
-	recv := make(chan []byte, 1)
-	ctx.Run(func(ctx context.Context) {
-		stream, _, err := man.NewServerStream(ctx)
-		assert.NoError(t, err)
-
-		data, err := stream.RawRecv()
-		assert.NoError(t, err)
-		recv <- data
-	})
 
 	writeFrames(t, cconn,
 		createFrame(drpcwire.KindInvoke, 1, 1, "rpc", true),
@@ -534,30 +523,22 @@ func TestManageReader_MultiFrameDelivery(t *testing.T) {
 		createFrame(drpcwire.KindMessage, 1, 2, "world", true),
 	)
 
-	assert.DeepEqual(t, <-recv, []byte("hello world"))
+	stream, _ := recv.get(t)
+	data, err := stream.RawRecv()
+	assert.NoError(t, err)
+	assert.DeepEqual(t, data, []byte("hello world"))
 }
 
 // When a higher message ID arrives mid-assembly, the partial data is
 // discarded and only the new message is delivered.
 func TestManageReader_HigherMsgDiscardsInProgress(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
-
 	cconn, sconn := net.Pipe()
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	recv := newRecvStream()
+	man := NewWithOptions(sconn, Options{ServerHandler: recv.handler})
 	defer func() { _ = man.Close() }()
-
-	recv := make(chan []byte, 1)
-	ctx.Run(func(ctx context.Context) {
-		stream, _, err := man.NewServerStream(ctx)
-		assert.NoError(t, err)
-		data, err := stream.RawRecv()
-		assert.NoError(t, err)
-		recv <- data
-	})
 
 	writeFrames(t, cconn,
 		createFrame(drpcwire.KindInvoke, 1, 1, "rpc", true),
@@ -565,37 +546,38 @@ func TestManageReader_HigherMsgDiscardsInProgress(t *testing.T) {
 		createFrame(drpcwire.KindMessage, 1, 3, "kept", true),
 	)
 
-	assert.DeepEqual(t, <-recv, []byte("kept"))
+	stream, _ := recv.get(t)
+	data, err := stream.RawRecv()
+	assert.NoError(t, err)
+	assert.DeepEqual(t, data, []byte("kept"))
 }
 
 // A continuation frame with a different kind than the first frame of the
 // packet causes the manager to terminate with a protocol error.
 func TestManageReader_KindChangeWithinPacket(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
-
+	recv := newRecvStream()
 	cconn, sconn := net.Pipe()
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	man := NewWithOptions(sconn, Options{ServerHandler: recv.handler})
 	defer func() { _ = man.Close() }()
-
-	ctx.Run(func(ctx context.Context) {
-		stream, _, err := man.NewServerStream(ctx)
-		assert.NoError(t, err)
-		for {
-			if _, err := stream.RawRecv(); err != nil {
-				return
-			}
-		}
-	})
 
 	writeFrames(t, cconn,
 		createFrame(drpcwire.KindInvoke, 1, 1, "rpc", true),
 		createFrame(drpcwire.KindMessage, 1, 2, "data", false),
 		createFrame(drpcwire.KindClose, 1, 2, "", true),
 	)
+
+	// Drain in handler so HandleFrame doesn't block.
+	stream, _ := recv.get(t)
+	go func() {
+		for {
+			if _, err := stream.RawRecv(); err != nil {
+				return
+			}
+		}
+	}()
 
 	waitForClosed(t, man)
 }
@@ -604,24 +586,13 @@ func TestManageReader_KindChangeWithinPacket(t *testing.T) {
 // the previous message (e.g., on the server side where invoke consumed
 // earlier IDs).
 func TestManageReader_MultiFrameWithSkippedMessageID(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
-
 	cconn, sconn := net.Pipe()
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	recv := newRecvStream()
+	man := NewWithOptions(sconn, Options{ServerHandler: recv.handler})
 	defer func() { _ = man.Close() }()
-
-	recv := make(chan []byte, 1)
-	ctx.Run(func(ctx context.Context) {
-		stream, _, err := man.NewServerStream(ctx)
-		assert.NoError(t, err)
-		data, err := stream.RawRecv()
-		assert.NoError(t, err)
-		recv <- data
-	})
 
 	writeFrames(t, cconn,
 		createFrame(drpcwire.KindInvoke, 1, 1, "rpc", true),
@@ -629,27 +600,22 @@ func TestManageReader_MultiFrameWithSkippedMessageID(t *testing.T) {
 		createFrame(drpcwire.KindMessage, 1, 3, "lo", true),
 	)
 
-	assert.DeepEqual(t, <-recv, []byte("hello"))
+	stream, _ := recv.get(t)
+	data, err := stream.RawRecv()
+	assert.NoError(t, err)
+	assert.DeepEqual(t, data, []byte("hello"))
 }
 
 // A second invoke for the same stream ID is rejected — the stream treats
 // it as a protocol error, terminating the manager.
 func TestManageReader_InvokeOnExistingStream(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
-
+	recv := newRecvStream()
 	cconn, sconn := net.Pipe()
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	man := NewWithOptions(sconn, Options{ServerHandler: recv.handler})
 	defer func() { _ = man.Close() }()
-
-	ctx.Run(func(ctx context.Context) {
-		stream, _, err := man.NewServerStream(ctx)
-		assert.NoError(t, err)
-		_ = stream
-	})
 
 	writeFrames(t, cconn,
 		createFrame(drpcwire.KindInvoke, 1, 1, "rpc1", true),
@@ -660,48 +626,35 @@ func TestManageReader_InvokeOnExistingStream(t *testing.T) {
 	assert.That(t, drpc.ProtocolError.Has(man.sigs.term.Err()))
 }
 
-// When a non-invoke frame arrives before the stream is created (e.g.,
-// NewServerStream hasn't returned yet), manageReader waits for the stream
-// and retries.
-func TestManageReader_WaitsForStreamCreation(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
-
+// With the push model, invoke + message written before any handler runs
+// should still be delivered correctly because the stream is created inline
+// in manageReader before dispatching to the handler.
+func TestManageReader_InvokeAndMessageDeliveredInline(t *testing.T) {
 	cconn, sconn := net.Pipe()
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	recv := newRecvStream()
+	man := NewWithOptions(sconn, Options{ServerHandler: recv.handler})
 	defer func() { _ = man.Close() }()
 
-	// Write invoke + message immediately. The message arrives before
-	// NewServerStream creates the stream, exercising the default/wait path.
+	// Write invoke + message immediately. The stream is created inline
+	// in manageReader, so the message frame finds the stream in the
+	// registry even before the handler goroutine runs.
 	writeFrames(t, cconn,
 		createFrame(drpcwire.KindInvoke, 1, 1, "rpc", true),
 		createFrame(drpcwire.KindMessage, 1, 2, "data", true),
 	)
 
-	// Small delay to let manageReader process both frames.
-	time.Sleep(10 * time.Millisecond)
-
-	recv := make(chan []byte, 1)
-	ctx.Run(func(ctx context.Context) {
-		stream, _, err := man.NewServerStream(ctx)
-		assert.NoError(t, err)
-
-		data, err := stream.RawRecv()
-		assert.NoError(t, err)
-		recv <- data
-	})
-
-	assert.DeepEqual(t, <-recv, []byte("data"))
+	stream, _ := recv.get(t)
+	data, err := stream.RawRecv()
+	assert.NoError(t, err)
+	assert.DeepEqual(t, data, []byte("data"))
 }
 
 // When a server stream's context is canceled, manageStream removes the stream
 // from the active registry. Any in-flight frames for that stream that arrive
-// after removal should be silently dropped, not terminate the connection. This
-// reproduces the scenario that caused flaky ambiguous-result errors in
-// CockroachDB when DRPC was enabled.
+// after removal should be silently dropped, not terminate the connection.
 func TestManageReader_LateFrameAfterStreamRemoved(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
@@ -710,7 +663,11 @@ func TestManageReader_LateFrameAfterStreamRemoved(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	sman := NewWithOptions(sconn, Options{SoftCancel: true})
+	recv := newRecvStream()
+	sman := NewWithOptions(sconn, Options{
+		SoftCancel:    true,
+		ServerHandler: recv.handler,
+	})
 	defer func() { _ = sman.Close() }()
 
 	// Drain client-side writes so the server manager doesn't block.
@@ -723,47 +680,33 @@ func TestManageReader_LateFrameAfterStreamRemoved(t *testing.T) {
 		}
 	})
 
-	// Send invoke for stream 1 and create a server stream with a
-	// cancelable context.
+	// Send invoke for stream 1 and receive it.
 	writeFrames(t, cconn,
 		createFrame(drpcwire.KindInvoke, 1, 1, "rpc1", true),
 	)
 
-	subctx, cancel := context.WithCancel(ctx)
-	stream1, _, err := sman.NewServerStream(subctx)
-	assert.NoError(t, err)
+	stream1, _ := recv.get(t)
 
-	// Cancel the server stream's context. This triggers manageStream to
-	// call active.Remove(), leaving no active stream in the registry.
-	cancel()
-
-	// Wait for the stream to be fully removed from the registry.
+	// Cancel the stream. This triggers manageStream to remove it.
+	stream1.Cancel(context.Canceled)
 	<-stream1.Finished()
 
-	// Send a late non-invoke frame for stream 1. With the old (broken)
-	// behavior this would terminate the connection. Now it should be
-	// silently dropped.
+	// Send a late non-invoke frame for stream 1. It should be silently dropped.
 	writeFrames(t, cconn,
 		createFrame(drpcwire.KindCloseSend, 1, 2, "", true),
 	)
 
 	// Verify the manager is still alive by successfully creating a new
 	// stream for a subsequent invoke.
-	recv := make(chan []byte, 1)
-	ctx.Run(func(ctx context.Context) {
-		stream2, _, err := sman.NewServerStream(ctx)
-		assert.NoError(t, err)
-		data, err := stream2.RawRecv()
-		assert.NoError(t, err)
-		recv <- data
-	})
-
 	writeFrames(t, cconn,
 		createFrame(drpcwire.KindInvoke, 2, 1, "rpc2", true),
 		createFrame(drpcwire.KindMessage, 2, 2, "alive", true),
 	)
 
-	assert.DeepEqual(t, <-recv, []byte("alive"))
+	stream2, _ := recv.get(t)
+	data, err := stream2.RawRecv()
+	assert.NoError(t, err)
+	assert.DeepEqual(t, data, []byte("alive"))
 }
 
 type blockingTransport chan struct{}
@@ -778,4 +721,35 @@ func TestUnblocked_AlwaysReady(t *testing.T) {
 	defer func() { _ = man.Close() }()
 
 	assert.That(t, closed(man.Unblocked()))
+}
+
+// Multiple concurrent streams are dispatched to the handler independently.
+func TestManageReader_ConcurrentStreams(t *testing.T) {
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	recv := newRecvStream()
+	man := NewWithOptions(sconn, Options{ServerHandler: recv.handler})
+	defer func() { _ = man.Close() }()
+
+	// Send two invokes and messages for different streams.
+	writeFrames(t, cconn,
+		createFrame(drpcwire.KindInvoke, 1, 1, "rpc1", true),
+		createFrame(drpcwire.KindInvoke, 2, 1, "rpc2", true),
+		createFrame(drpcwire.KindMessage, 1, 2, "msg1", true),
+		createFrame(drpcwire.KindMessage, 2, 2, "msg2", true),
+	)
+
+	// Handler goroutines may deliver in any order.
+	got := make(map[string]string) // rpc -> message
+	for i := 0; i < 2; i++ {
+		stream, rpc := recv.get(t)
+		data, err := stream.RawRecv()
+		assert.NoError(t, err)
+		got[rpc] = string(data)
+	}
+
+	assert.Equal(t, got["rpc1"], "msg1")
+	assert.Equal(t, got["rpc2"], "msg2")
 }

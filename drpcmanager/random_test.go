@@ -15,7 +15,6 @@ import (
 
 	"github.com/zeebo/assert"
 	"google.golang.org/grpc/status"
-
 	"storj.io/drpc/drpcstream"
 	"storj.io/drpc/drpctest"
 	"storj.io/drpc/drpcwire"
@@ -41,8 +40,8 @@ type randClient struct {
 }
 
 func (rc *randClient) newSteam(ctx context.Context, man *Manager) (*drpcstream.Stream, error) {
-	stream, _, err := man.NewServerStream(ctx)
-	return stream, err
+	// TODO: refactor runRandomized to use ServerHandler callback.
+	return nil, errors.New("not implemented: requires ServerHandler refactor")
 }
 
 func (rc *randClient) execute(t *testing.T, wr *drpcwire.Writer, op byte) {

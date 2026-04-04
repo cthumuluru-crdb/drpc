@@ -46,15 +46,23 @@ type Options struct {
 	// being flushed when the cancel happens.
 	SoftCancel bool
 
-	// InactivityTimeout is the amount of time the manager will wait when
-	// creating a NewServerStream. It only includes the time it is reading
-	// packets from the remote client. In other words, it only includes the time
-	// that the client could delay before invoking an RPC. If zero or negative,
-	// no timeout is used.
+	// InactivityTimeout is the amount of time the manager will wait for
+	// the first invoke frame from the remote side. If no invoke frame is
+	// received within this duration, the manager terminates. If zero or
+	// negative, no timeout is used.
 	InactivityTimeout time.Duration
 
 	// Internal contains options that are for internal use only.
 	Internal drpcopts.Manager
+
+	// ServerContext, when set, is used as the base context for server-side
+	// streams.
+	ServerContext context.Context
+
+	// ServerHandler, when set, is called in a new goroutine for each
+	// incoming server-side RPC. The handler receives the stream and the
+	// RPC method name. If nil, invoke frames will cause a protocol error.
+	ServerHandler func(stream *drpcstream.Stream, rpc string)
 
 	// GRPCMetadataCompatMode enables/disable gRPC compatibility for metadata
 	// handling. When enabled, the server stream will decode incoming metadata
@@ -84,9 +92,6 @@ type Manager struct {
 	pendingStreams     map[uint64]*pendingStream // per-stream invoke assembly state
 	lastInvokeStreamID uint64                    // highest stream ID seen in an invoke; enforces monotonicity
 
-	serverStreamReqs chan serverStreamReq // new server stream request from manageReader to NewServerStream
-	pdone            drpcsignal.Chan      // signals when NewServerStream has registered the new stream
-
 	sigs struct {
 		term  drpcsignal.Signal // set when the manager should start terminating
 		read  drpcsignal.Signal // set after the goroutine reading from the transport is done
@@ -103,14 +108,6 @@ type pendingStream struct {
 	metadata map[string]string
 }
 
-// serverStreamReq carries the assembled invoke data from manageReader to
-// NewServerStream.
-type serverStreamReq struct {
-	sid      uint64
-	metadata map[string]string
-	data     []byte // RPC name bytes from the KindInvoke packet
-}
-
 // New returns a new Manager for the transport.
 func New(tr drpc.Transport) *Manager {
 	return NewWithOptions(tr, Options{})
@@ -124,13 +121,8 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 		wr:   drpcwire.NewWriter(tr, opts.WriterBufferSize),
 		rd:   drpcwire.NewReaderWithOptions(tr, opts.Reader),
 		opts: opts,
-
-		serverStreamReqs: make(chan serverStreamReq),
 	}
 
-	// a buffer of size 1 allows NewServerStream to signal it is done creating a
-	// new server stream without having to coordinate with manageReader.
-	m.pdone.Make(1)
 	m.pendingStreams = make(map[uint64]*pendingStream)
 	m.activeStreams = newActiveStreams(&m.sigs.term, &m.sigs.tport)
 
@@ -211,10 +203,11 @@ func (m *Manager) manageReader() {
 	}
 }
 
-// handleInvokeFrame assembles invoke/metadata frames into complete packets and
-// forwards the finished invoke info to NewServerStream via m.serverStreamReqs.
-// Metadata packets are accumulated per-stream; the invoke packet triggers the
-// send. Invoke frames for different streams may interleave on the wire.
+// handleInvokeFrame assembles invoke/metadata frames into complete packets,
+// creates the server stream, and dispatches to the ServerHandler callback.
+// Metadata packets are accumulated per-stream; the invoke packet triggers
+// stream creation. Invoke frames for different streams may interleave on
+// the wire.
 func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 	var ps *pendingStream
 	switch eps, found := m.pendingStreams[fr.ID.Stream]; {
@@ -262,17 +255,44 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 		return nil
 	}
 
-	// Invoke packet completes the sequence. Send to NewServerStream.
-	select {
-	case m.serverStreamReqs <- serverStreamReq{sid: pkt.ID.Stream, data: pkt.Data, metadata: ps.metadata}:
-		// Wait for NewServerStream to finish stream creation (including
-		// sbuf.Set) before reading the next frame. This guarantees the
-		// stream is in the registry for subsequent non-invoke packets.
-		m.pdone.Recv()
-
-		delete(m.pendingStreams, pkt.ID.Stream)
-	case <-m.sigs.term.Signal(): // TODO(server): in theory this should be no-op.
+	// TODO(server): The following constraints are not strictly necessary.
+	// We should panic but we will defer that until we separate manager into
+	// client and server managers.
+	//
+	// Invoke packet completes the sequence. Create stream and dispatch.
+	if m.opts.ServerHandler == nil {
+		return drpc.InternalError.New("invoke received but no ServerHandler configured")
 	}
+	ctx := m.opts.ServerContext
+	if ctx == nil {
+		return drpc.InternalError.New("server base context is nil")
+	}
+
+	if ps.metadata != nil {
+		if m.opts.GRPCMetadataCompatMode {
+			grpcMeta := make(map[string][]string, len(ps.metadata))
+			for k, v := range ps.metadata {
+				grpcMeta[k] = []string{v}
+			}
+			ctx = grpcmetadata.NewIncomingContext(ctx, grpcMeta)
+		} else {
+			ctx = drpcmetadata.NewIncomingContext(ctx, ps.metadata)
+		}
+	}
+
+	rpc := string(pkt.Data)
+	stream, err := m.newStream(ctx, pkt.ID.Stream, drpc.StreamKindServer, rpc)
+	if err != nil {
+		return err
+	}
+	// TODO(server): we should remove this regardless of server stream creation
+	// success.
+	delete(m.pendingStreams, pkt.ID.Stream)
+
+	m.wg.Add(1)
+	go m.manageStream(ctx, stream)
+	go m.opts.ServerHandler(stream, rpc)
+
 	return nil
 }
 
@@ -295,9 +315,6 @@ func (m *Manager) newStream(
 	if err := m.activeStreams.Add(sid, stream); err != nil {
 		return nil, err
 	}
-
-	m.wg.Add(1)
-	go m.manageStream(ctx, stream)
 
 	m.log("STREAM", stream.String)
 
@@ -381,64 +398,15 @@ func (m *Manager) NewClientStream(
 		return nil, err
 	}
 
-	return m.newStream(ctx, m.lastStreamID.Add(1), drpc.StreamKindClient, rpc)
-}
-
-// NewServerStream starts a stream on the managed transport for use by a server.
-// It does this by waiting for the client to issue an invoke message and
-// returning the details.
-func (m *Manager) NewServerStream(
-	ctx context.Context,
-) (stream *drpcstream.Stream, rpc string, err error) {
-	if err := ctx.Err(); err != nil {
-		return nil, "", err
-	} else if err, ok := m.sigs.term.Get(); ok {
-		return nil, "", err
+	stream, err = m.newStream(ctx, m.lastStreamID.Add(1), drpc.StreamKindClient, rpc)
+	if err != nil {
+		return nil, err
 	}
 
-	var timeoutCh <-chan time.Time
+	m.wg.Add(1)
+	go m.manageStream(ctx, stream)
 
-	// set up the timeout on the context if necessary.
-	if timeout := m.opts.InactivityTimeout; timeout > 0 {
-		timer := time.NewTimer(timeout)
-		defer timer.Stop()
-		timeoutCh = timer.C
-	}
-
-	select {
-	case <-timeoutCh:
-		return nil, "", context.DeadlineExceeded
-
-	case <-ctx.Done():
-		return nil, "", ctx.Err()
-
-	case <-m.sigs.term.Signal():
-		return nil, "", m.sigs.term.Err()
-
-	case pkt := <-m.serverStreamReqs:
-		rpc = string(pkt.data)
-		if pkt.metadata != nil {
-			if m.opts.GRPCMetadataCompatMode {
-				// Populate incoming metadata as grpc metadata in the
-				// context. This is a short-term fix that will enable us
-				// to send and receive grpc metadata when DRPC is enabled,
-				// without any changes in the calling code.
-				grpcMeta := make(map[string][]string, len(pkt.metadata))
-				for k, v := range pkt.metadata {
-					grpcMeta[k] = []string{v}
-				}
-				ctx = grpcmetadata.NewIncomingContext(ctx, grpcMeta)
-			} else {
-				// Add metadata to the incoming context.
-				ctx = drpcmetadata.NewIncomingContext(ctx, pkt.metadata)
-			}
-		}
-		stream, err := m.newStream(ctx, pkt.sid, drpc.StreamKindServer, rpc)
-		// Signal pdone only after stream registration so that manageReader sees
-		// the new stream in the registry when it reads the next frame.
-		m.pdone.Send()
-		return stream, rpc, err
-	}
+	return stream, nil
 }
 
 func isConnectionReset(err error) bool {

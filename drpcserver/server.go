@@ -173,17 +173,24 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 
 	tr = s.opts.Metrics.toMeteredTransport(tr)
 
-	man := drpcmanager.NewWithOptions(tr, s.opts.Manager)
+	opts := s.opts.Manager
+	opts.ServerContext = ctx
+	opts.ServerHandler = func(stream *drpcstream.Stream, rpc string) {
+		if err := s.handleRPC(stream, rpc); err != nil {
+			if s.opts.Log != nil {
+				s.opts.Log(err)
+			}
+		}
+	}
+
+	man := drpcmanager.NewWithOptions(tr, opts)
 	defer func() { err = errs.Combine(err, man.Close()) }()
 
-	for {
-		stream, rpc, err := man.NewServerStream(ctx)
-		if err != nil {
-			return errs.Wrap(err)
-		}
-		if err := s.handleRPC(stream, rpc); err != nil {
-			return errs.Wrap(err)
-		}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-man.Closed():
+		return man.Close()
 	}
 }
 
