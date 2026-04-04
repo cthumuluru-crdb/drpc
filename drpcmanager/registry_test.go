@@ -19,8 +19,8 @@ func testStream(id uint64) *drpcstream.Stream {
 // testActiveStreams returns an activeStreams with fresh term and tport signals.
 func testActiveStreams() (*activeStreams, *Manager) {
 	m := &Manager{}
-	m.active = newActiveStreams(&m.sigs.term, &m.sigs.tport)
-	return m.active, m
+	m.activeStreams = newActiveStreams(&m.sigs.term, &m.sigs.tport)
+	return m.activeStreams, m
 }
 
 func TestActiveStreams_AddAndLatest(t *testing.T) {

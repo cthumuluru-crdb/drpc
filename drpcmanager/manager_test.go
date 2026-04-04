@@ -8,7 +8,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"sync"
 	"testing"
 	"time"
 
@@ -16,7 +15,6 @@ import (
 	grpcmetadata "google.golang.org/grpc/metadata"
 	"storj.io/drpc"
 	"storj.io/drpc/drpcmetadata"
-
 	"storj.io/drpc/drpctest"
 	"storj.io/drpc/drpcwire"
 )
@@ -70,10 +68,7 @@ func TestDrpcMetadata(t *testing.T) {
 		assert.NoError(t, stream.RawWrite(drpcwire.KindInvoke, []byte("invoke")))
 		assert.NoError(t, stream.RawWrite(drpcwire.KindMessage, []byte("message")))
 		assert.NoError(t, stream.RawFlush())
-		assert.That(t, !closed(cman.Unblocked()))
-
 		assert.NoError(t, stream.Close())
-		assert.That(t, closed(cman.Unblocked()))
 	})
 
 	ctx.Run(func(ctx context.Context) {
@@ -130,10 +125,7 @@ func TestDrpcMetadataWithGRPCMetadataCompatMode(t *testing.T) {
 		assert.NoError(t, stream.RawWrite(drpcwire.KindInvoke, []byte("invoke")))
 		assert.NoError(t, stream.RawWrite(drpcwire.KindMessage, []byte("message")))
 		assert.NoError(t, stream.RawFlush())
-		assert.That(t, !closed(cman.Unblocked()))
-
 		assert.NoError(t, stream.Close())
-		assert.That(t, closed(cman.Unblocked()))
 	})
 
 	ctx.Run(func(ctx context.Context) {
@@ -197,8 +189,9 @@ func waitForClosed(t *testing.T, man *Manager) {
 // manageReader tests
 //
 
-// Global frame monotonicity: a frame with an ID lower than the last seen
-// frame causes the manager to terminate with a protocol error.
+// Within a single stream, message IDs must be monotonically increasing.
+// The stream's own PacketAssembler enforces this, causing the manager to
+// terminate with a protocol error.
 func TestManageReader_GlobalMonotonicity_SameStream(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
@@ -230,9 +223,9 @@ func TestManageReader_GlobalMonotonicity_SameStream(t *testing.T) {
 	waitForClosed(t, man)
 }
 
-// Cross-stream monotonicity: after seeing stream 2, a frame for stream 1
-// with a higher message ID is still rejected because {1,x} < {2,y}.
-func TestManageReader_GlobalMonotonicity_CrossStream(t *testing.T) {
+// Cross-stream frames: after a stream is removed, frames for that stream ID
+// are silently ignored and the manager stays alive.
+func TestManageReader_CrossStreamFramesIgnored(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
 
@@ -240,26 +233,93 @@ func TestManageReader_GlobalMonotonicity_CrossStream(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	man := New(sconn)
+	man := NewWithOptions(sconn, Options{SoftCancel: true})
 	defer func() { _ = man.Close() }()
 
-	// Consume both invokes so manageReader can proceed.
+	// Drain client-side writes.
 	ctx.Run(func(ctx context.Context) {
-		_, _, _ = man.NewServerStream(ctx)
-		_, _, _ = man.NewServerStream(ctx)
+		buf := make([]byte, 4096)
+		for {
+			if _, err := cconn.Read(buf); err != nil {
+				return
+			}
+		}
+	})
+
+	// Create stream 1 with a cancelable context, then cancel it.
+	subctx, cancel := context.WithCancel(ctx)
+	writeFrames(t, cconn,
+		createFrame(drpcwire.KindInvoke, 1, 1, "rpc1", true),
+	)
+	stream1, _, err := man.NewServerStream(subctx)
+	assert.NoError(t, err)
+	cancel()
+	<-stream1.Finished()
+
+	// Send a frame for the now-removed stream 1, then a valid invoke for
+	// stream 2. The stale frame should be silently dropped.
+	recv := make(chan []byte, 1)
+	ctx.Run(func(ctx context.Context) {
+		stream2, _, err := man.NewServerStream(ctx)
+		assert.NoError(t, err)
+		data, err := stream2.RawRecv()
+		assert.NoError(t, err)
+		recv <- data
 	})
 
 	writeFrames(t, cconn,
-		createFrame(drpcwire.KindInvoke, 1, 1, "rpc1", true),
+		createFrame(drpcwire.KindMessage, 1, 4, "stale", true),
 		createFrame(drpcwire.KindInvoke, 2, 1, "rpc2", true),
-		createFrame(drpcwire.KindMessage, 1, 4, "bad", true),
+		createFrame(drpcwire.KindMessage, 2, 2, "fresh", true),
+	)
+
+	assert.DeepEqual(t, <-recv, []byte("fresh"))
+}
+
+// Invoke stream ID regression: after invoking stream 2, an invoke for stream 1
+// is rejected by the invoke stream ID monotonicity check.
+func TestManageReader_InvokeStreamIDRegression(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	man := NewWithOptions(sconn, Options{SoftCancel: true})
+	defer func() { _ = man.Close() }()
+
+	// Drain client-side writes.
+	ctx.Run(func(ctx context.Context) {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := cconn.Read(buf); err != nil {
+				return
+			}
+		}
+	})
+
+	// Create and cancel stream 2.
+	subctx, cancel := context.WithCancel(ctx)
+	writeFrames(t, cconn,
+		createFrame(drpcwire.KindInvoke, 2, 1, "rpc2", true),
+	)
+	stream2, _, err := man.NewServerStream(subctx)
+	assert.NoError(t, err)
+	cancel()
+	<-stream2.Finished()
+
+	// Now send an invoke for stream 1 (lower than 2). This should terminate
+	// the manager with a protocol error.
+	writeFrames(t, cconn,
+		createFrame(drpcwire.KindInvoke, 1, 1, "rpc1", true),
 	)
 
 	waitForClosed(t, man)
 }
 
-// Invoke replay: after [s1,m1,invoke,done=true], lastFrameID is bumped to
-// {1,2}. A replayed [s1,m1,invoke] is caught by the monotonicity check.
+// Invoke replay: a second invoke for the same stream ID is delivered to the
+// active stream, which rejects it as "invoke on existing stream".
 func TestManageReader_InvokeReplayBlocked(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
@@ -339,13 +399,12 @@ func TestManageReader_OldStreamFramesIgnored(t *testing.T) {
 		}
 	})
 
-	// Create stream 1 on the client, then cancel it so the client
-	// advances to stream 2.
+	// Create stream 1 on the client, then cancel it so it finishes.
 	subctx, cancel := context.WithCancel(ctx)
-	_, err := cman.NewClientStream(subctx, "rpc1")
+	stream1, err := cman.NewClientStream(subctx, "rpc1")
 	assert.NoError(t, err)
 	cancel()
-	<-cman.Unblocked()
+	<-stream1.Finished()
 
 	stream2, err := cman.NewClientStream(ctx, "rpc2")
 	assert.NoError(t, err)
@@ -673,14 +732,13 @@ func TestManageReader_LateFrameAfterStreamRemoved(t *testing.T) {
 	subctx, cancel := context.WithCancel(ctx)
 	stream1, _, err := sman.NewServerStream(subctx)
 	assert.NoError(t, err)
-	_ = stream1
 
 	// Cancel the server stream's context. This triggers manageStream to
 	// call active.Remove(), leaving no active stream in the registry.
 	cancel()
 
 	// Wait for the stream to be fully removed from the registry.
-	<-sman.Unblocked()
+	<-stream1.Finished()
 
 	// Send a late non-invoke frame for stream 1. With the old (broken)
 	// behavior this would terminate the connection. Now it should be
@@ -714,131 +772,10 @@ func (b blockingTransport) Read(p []byte) (n int, err error)  { <-b; return 0, i
 func (b blockingTransport) Write(p []byte) (n int, err error) { <-b; return 0, io.EOF }
 func (b blockingTransport) Close() error                      { close(b); return nil }
 
-func TestUnblocked_NoCancel(t *testing.T) {
-	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
+// Unblocked always returns a closed channel with multiplexing support.
+func TestUnblocked_AlwaysReady(t *testing.T) {
+	man := New(make(blockingTransport))
+	defer func() { _ = man.Close() }()
 
-	cconn, sconn := net.Pipe()
-	defer func() { _ = cconn.Close() }()
-	defer func() { _ = sconn.Close() }()
-
-	cman := New(cconn)
-	defer func() { _ = cman.Close() }()
-
-	sman := New(sconn)
-	defer func() { _ = sman.Close() }()
-
-	ctx.Run(func(ctx context.Context) {
-		stream, err := cman.NewClientStream(ctx, "rpc")
-		assert.NoError(t, err)
-		defer func() { _ = stream.Close() }()
-
-		assert.NoError(t, stream.RawWrite(drpcwire.KindInvoke, []byte("invoke")))
-		assert.NoError(t, stream.RawWrite(drpcwire.KindMessage, []byte("message")))
-		assert.NoError(t, stream.RawFlush())
-		assert.That(t, !closed(cman.Unblocked()))
-
-		assert.NoError(t, stream.Close())
-		assert.That(t, closed(cman.Unblocked()))
-	})
-
-	ctx.Run(func(ctx context.Context) {
-		stream, _, err := sman.NewServerStream(ctx)
-		assert.NoError(t, err)
-		defer func() { _ = stream.Close() }()
-
-		_, err = stream.RawRecv()
-		assert.NoError(t, err)
-
-		_, err = stream.RawRecv()
-		assert.That(t, errors.Is(err, io.EOF))
-	})
-
-	ctx.Wait()
+	assert.That(t, closed(man.Unblocked()))
 }
-
-func TestUnblocked_SoftCancel(t *testing.T) {
-	run := func(t *testing.T, softCancel bool) {
-		ctx := drpctest.NewTracker(t)
-		defer ctx.Close()
-
-		tr := newBlockedTransport()
-		man := NewWithOptions(tr, Options{SoftCancel: softCancel})
-		defer func() { _ = man.Close() }()
-		defer tr.setReadOpen(true)
-		defer tr.setWriteOpen(true)
-
-		for i := 0; i < 10; i++ {
-			func() {
-				subctx, cancel := context.WithCancel(ctx)
-				defer cancel()
-
-				stream, err := man.NewClientStream(subctx, "rpc")
-				if softCancel {
-					assert.NoError(t, err)
-				} else if i > 0 {
-					assert.Error(t, err)
-					return
-				}
-				defer func() { _ = stream.Close() }()
-
-				assert.That(t, !closed(man.Unblocked()))
-				cancel()
-
-				// temporary unblock writing to allow the stream to finish soft cancel
-				tr.setWriteOpen(true)
-				<-man.Unblocked()
-				tr.setWriteOpen(false)
-			}()
-		}
-	}
-
-	t.Run("Enabled", func(t *testing.T) { run(t, true) })
-	t.Run("Disabled", func(t *testing.T) { run(t, false) })
-}
-
-type blockedTransport struct {
-	mu *sync.Mutex
-	co *sync.Cond
-	ro bool
-	wo bool
-}
-
-func newBlockedTransport() *blockedTransport {
-	mu := new(sync.Mutex)
-	co := sync.NewCond(mu)
-	return &blockedTransport{
-		mu: mu,
-		co: co,
-	}
-}
-
-func (b *blockedTransport) setWriteOpen(open bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b.wo = open
-	b.co.Broadcast()
-}
-
-func (b *blockedTransport) setReadOpen(open bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b.ro = open
-	b.co.Broadcast()
-}
-
-func (b *blockedTransport) wait(p int, rw *bool) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	for !*rw {
-		b.co.Wait()
-	}
-	return p, nil
-}
-
-func (b *blockedTransport) Read(p []byte) (n int, err error)  { return b.wait(len(p), &b.ro) }
-func (b *blockedTransport) Write(p []byte) (n int, err error) { return b.wait(len(p), &b.wo) }
-func (b *blockedTransport) Close() error                      { return nil }
