@@ -14,20 +14,14 @@ import (
 	"storj.io/drpc/drpcmanager"
 	"storj.io/drpc/drpcmetadata"
 	"storj.io/drpc/drpcmetrics"
-	"storj.io/drpc/drpcstats"
 	"storj.io/drpc/drpcstream"
 	"storj.io/drpc/drpcwire"
-	"storj.io/drpc/internal/drpcopts"
 )
 
 // Options controls configuration settings for a conn.
 type Options struct {
 	// Manager controls the options we pass to the manager of this conn.
 	Manager drpcmanager.Options
-
-	// CollectStats controls whether the client should collect stats on the
-	// rpcs it creates.
-	CollectStats bool
 
 	// Metrics holds optional metrics the client will populate. If nil, no
 	// metrics are recorded.
@@ -40,8 +34,6 @@ type Conn struct {
 	man  *drpcmanager.Manager
 	mu   sync.Mutex
 	wbuf []byte
-
-	stats map[string]*drpcstats.Stats
 }
 
 var _ drpc.Conn = (*Conn)(nil)
@@ -62,39 +54,9 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Conn {
 		c.tr = tr
 	}
 
-	if opts.CollectStats {
-		drpcopts.SetManagerStatsCB(&opts.Manager.Internal, c.getStats)
-		c.stats = make(map[string]*drpcstats.Stats)
-	}
-
 	c.man = drpcmanager.NewWithOptions(tr, opts.Manager)
 
 	return c
-}
-
-// Stats returns the collected stats grouped by rpc.
-func (c *Conn) Stats() map[string]drpcstats.Stats {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	stats := make(map[string]drpcstats.Stats, len(c.stats))
-	for k, v := range c.stats {
-		stats[k] = v.AtomicClone()
-	}
-	return stats
-}
-
-// getStats returns the drpcopts.Stats struct for the given rpc.
-func (c *Conn) getStats(rpc string) *drpcstats.Stats {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	stats := c.stats[rpc]
-	if stats == nil {
-		stats = new(drpcstats.Stats)
-		c.stats[rpc] = stats
-	}
-	return stats
 }
 
 // Transport returns the transport the conn is using.
