@@ -6,6 +6,7 @@ package drpcconn
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -181,6 +182,90 @@ func TestConn_NewStreamSendsGrpcAndDrpcMetadata(t *testing.T) {
 	s, err := conn.NewStream(ctx, "/com.example.Foo/Bar", testEncoding{})
 	assert.NoError(t, err)
 	_ = s.CloseSend()
+}
+
+func TestConn_ConcurrentInvoke(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	pc, ps := net.Pipe()
+	defer func() { _ = pc.Close() }()
+	defer func() { _ = ps.Close() }()
+
+	// slowReady is closed when the slow handler has received the request,
+	// signaling that the fast handler can proceed.
+	slowReady := make(chan struct{})
+
+	// Server goroutine: handle two concurrent streams. The first stream
+	// (slow) blocks until the second (fast) completes its response.
+	ctx.Run(func(ctx context.Context) {
+		rd := drpcwire.NewReader(ps)
+		wr := drpcwire.NewWriter(ps, 1024)
+
+		// Read slow stream: Invoke + Message + CloseSend
+		inv1, _ := rd.ReadFrame() // Invoke (stream 1)
+		msg1, _ := rd.ReadFrame() // Message (stream 1)
+		_, _ = rd.ReadFrame()     // CloseSend (stream 1)
+		_ = msg1
+
+		close(slowReady)
+
+		// Read fast stream: Invoke + Message + CloseSend
+		inv2, _ := rd.ReadFrame() // Invoke (stream 2)
+		msg2, _ := rd.ReadFrame() // Message (stream 2)
+		_, _ = rd.ReadFrame()     // CloseSend (stream 2)
+		_ = msg2
+
+		// Respond to fast stream first.
+		_ = wr.WritePacket(drpcwire.Packet{
+			Data: []byte("fast-reply"),
+			ID:   drpcwire.ID{Stream: inv2.ID.Stream, Message: 1},
+			Kind: drpcwire.KindMessage,
+		})
+		_ = wr.Flush()
+
+		// Now respond to slow stream.
+		_ = wr.WritePacket(drpcwire.Packet{
+			Data: []byte("slow-reply"),
+			ID:   drpcwire.ID{Stream: inv1.ID.Stream, Message: 1},
+			Kind: drpcwire.KindMessage,
+		})
+		_ = wr.Flush()
+
+		// Read close frames.
+		_, _ = rd.ReadFrame() // Close (fast)
+		_, _ = rd.ReadFrame() // Close (slow)
+	})
+
+	conn := New(pc)
+
+	var wg sync.WaitGroup
+	var slowOut, fastOut string
+	var slowErr, fastErr error
+
+	// Launch slow invoke.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		in := "slow-req"
+		slowErr = conn.Invoke(ctx, "/svc/Slow", testEncoding{}, &in, &slowOut)
+	}()
+
+	// Wait for slow request to reach the server, then launch fast invoke.
+	<-slowReady
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		in := "fast-req"
+		fastErr = conn.Invoke(ctx, "/svc/Fast", testEncoding{}, &in, &fastOut)
+	}()
+
+	wg.Wait()
+
+	assert.NoError(t, slowErr)
+	assert.NoError(t, fastErr)
+	assert.Equal(t, slowOut, "slow-reply")
+	assert.Equal(t, fastOut, "fast-reply")
 }
 
 func TestConn_encodeMetadata(t *testing.T) {
