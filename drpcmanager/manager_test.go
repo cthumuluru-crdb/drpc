@@ -268,7 +268,7 @@ func TestManageReader_CrossStreamFramesIgnored(t *testing.T) {
 
 	recv := newRecvStream()
 	man := NewWithOptions(sconn, Options{
-		SoftCancel:    true,
+
 		ServerHandler: recv.handler,
 	})
 	defer func() { _ = man.Close() }()
@@ -317,7 +317,7 @@ func TestManageReader_InvokeStreamIDRegression(t *testing.T) {
 
 	recv := newRecvStream()
 	man := NewWithOptions(sconn, Options{
-		SoftCancel:    true,
+
 		ServerHandler: recv.handler,
 	})
 	defer func() { _ = man.Close() }()
@@ -401,7 +401,7 @@ func TestManageReader_OldStreamFramesIgnored(t *testing.T) {
 	defer func() { _ = cconn.Close() }()
 	defer func() { _ = sconn.Close() }()
 
-	cman := NewWithOptions(cconn, Options{SoftCancel: true})
+	cman := New(cconn)
 	defer func() { _ = cman.Close() }()
 
 	// Drain all client writes so nothing blocks, and write server
@@ -665,7 +665,7 @@ func TestManageReader_LateFrameAfterStreamRemoved(t *testing.T) {
 
 	recv := newRecvStream()
 	sman := NewWithOptions(sconn, Options{
-		SoftCancel:    true,
+
 		ServerHandler: recv.handler,
 	})
 	defer func() { _ = sman.Close() }()
@@ -707,6 +707,77 @@ func TestManageReader_LateFrameAfterStreamRemoved(t *testing.T) {
 	data, err := stream2.RawRecv()
 	assert.NoError(t, err)
 	assert.DeepEqual(t, data, []byte("alive"))
+}
+
+// Creating a new client stream must not discard unflushed data from a
+// previously created stream. Regression test for the Writer.Reset() bug
+// where NewWithOptions cleared the shared Writer buffer on every stream
+// creation.
+func TestNewClientStream_PreservesBufferedData(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	// Use a large writer buffer so frames stay buffered (not auto-flushed).
+	cman := NewWithOptions(cconn, Options{WriterBufferSize: 64 * 1024})
+	defer func() { _ = cman.Close() }()
+
+	// Create stream 1 and write frames that stay in the shared Writer buffer.
+	stream1, err := cman.NewClientStream(ctx, "rpc1")
+	assert.NoError(t, err)
+	assert.NoError(t, stream1.RawWrite(drpcwire.KindInvoke, []byte("rpc1")))
+	assert.NoError(t, stream1.RawWrite(drpcwire.KindMessage, []byte("data1")))
+
+	// Create stream 2. Before the fix, this called Writer.Reset() which
+	// would clear stream 1's buffered frames from the shared Writer.
+	stream2, err := cman.NewClientStream(ctx, "rpc2")
+	assert.NoError(t, err)
+	assert.NoError(t, stream2.RawWrite(drpcwire.KindInvoke, []byte("rpc2")))
+	assert.NoError(t, stream2.RawWrite(drpcwire.KindMessage, []byte("data2")))
+
+	// Read frames on the server side. The pipe Read blocks until Flush
+	// writes data, so start reading before flushing.
+	type readResult struct {
+		frames []drpcwire.Frame
+		err    error
+	}
+	results := make(chan readResult, 1)
+	ctx.Run(func(ctx context.Context) {
+		rd := drpcwire.NewReader(sconn)
+		var frames []drpcwire.Frame
+		for i := 0; i < 4; i++ {
+			fr, err := rd.ReadFrame()
+			if err != nil {
+				results <- readResult{frames, err}
+				return
+			}
+			frames = append(frames, fr)
+		}
+		results <- readResult{frames, nil}
+	})
+
+	// Flush sends all buffered data (both streams) to the pipe.
+	assert.NoError(t, stream1.RawFlush())
+
+	select {
+	case r := <-results:
+		assert.NoError(t, r.err)
+		assert.Equal(t, len(r.frames), 4)
+
+		// Collect frames by stream ID.
+		got := make(map[uint64][]string)
+		for _, fr := range r.frames {
+			got[fr.ID.Stream] = append(got[fr.ID.Stream], string(fr.Data))
+		}
+		assert.DeepEqual(t, got[stream1.ID()], []string{"rpc1", "data1"})
+		assert.DeepEqual(t, got[stream2.ID()], []string{"rpc2", "data2"})
+
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for frames")
+	}
 }
 
 type blockingTransport chan struct{}
@@ -752,4 +823,106 @@ func TestManageReader_ConcurrentStreams(t *testing.T) {
 
 	assert.Equal(t, got["rpc1"], "msg1")
 	assert.Equal(t, got["rpc2"], "msg2")
+}
+
+// Canceling one client stream must not affect a sibling stream on the same
+// manager. The manager must stay alive and the sibling must complete normally.
+func TestManageStream_CancelIsolation(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	cman := New(cconn)
+	defer func() { _ = cman.Close() }()
+
+	// Drain cancel frames from the client side so writes don't block.
+	ctx.Run(func(ctx context.Context) {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := sconn.Read(buf); err != nil {
+				return
+			}
+		}
+	})
+
+	// Create two client streams.
+	ctx1, cancel1 := context.WithCancel(ctx)
+	stream1, err := cman.NewClientStream(ctx1, "rpc1")
+	assert.NoError(t, err)
+
+	stream2, err := cman.NewClientStream(ctx, "rpc2")
+	assert.NoError(t, err)
+
+	// Cancel stream 1's context.
+	cancel1()
+	<-stream1.Finished()
+
+	// Stream 2 should still be alive and the manager should not be terminated.
+	assert.That(t, !closed(cman.Closed()))
+	assert.That(t, !stream2.IsTerminated())
+
+	// Stream 2 can still write successfully.
+	assert.NoError(t, stream2.RawWrite(drpcwire.KindInvoke, []byte("rpc2")))
+	assert.NoError(t, stream2.RawFlush())
+	assert.NoError(t, stream2.Close())
+}
+
+// When a client stream's context is canceled, a KindCancel frame is sent
+// to the remote side so it can stop processing that stream.
+func TestManageStream_CancelSendsFrame(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	cman := New(cconn)
+	defer func() { _ = cman.Close() }()
+
+	// Read frames from the server side.
+	type frameResult struct {
+		fr  drpcwire.Frame
+		err error
+	}
+	frames := make(chan frameResult, 10)
+	ctx.Run(func(ctx context.Context) {
+		rd := drpcwire.NewReader(sconn)
+		for {
+			fr, err := rd.ReadFrame()
+			frames <- frameResult{fr, err}
+			if err != nil {
+				return
+			}
+		}
+	})
+
+	// Create a cancelable stream and send its invoke.
+	subctx, cancel := context.WithCancel(ctx)
+	stream, err := cman.NewClientStream(subctx, "rpc1")
+	assert.NoError(t, err)
+	assert.NoError(t, stream.RawWrite(drpcwire.KindInvoke, []byte("rpc1")))
+	assert.NoError(t, stream.RawFlush())
+
+	// Read the invoke frame.
+	r := <-frames
+	assert.NoError(t, r.err)
+	assert.Equal(t, r.fr.Kind, drpcwire.KindInvoke)
+	sid := r.fr.ID.Stream
+
+	// Cancel the context — should trigger a cancel frame.
+	cancel()
+
+	// Read the cancel frame.
+	select {
+	case r := <-frames:
+		assert.NoError(t, r.err)
+		assert.Equal(t, r.fr.Kind, drpcwire.KindCancel)
+		assert.Equal(t, r.fr.ID.Stream, sid)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for cancel frame")
+	}
 }

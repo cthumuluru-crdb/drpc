@@ -14,9 +14,7 @@ import (
 	"github.com/zeebo/assert"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-
 	"storj.io/drpc/drpcconn"
-	"storj.io/drpc/drpcmanager"
 	"storj.io/drpc/drpcmux"
 	"storj.io/drpc/drpcserver"
 	"storj.io/drpc/drpctest"
@@ -164,8 +162,7 @@ func TestTransport_ClosedWhileHandlerBlockedBeforeRecv(t *testing.T) {
 	handlerStarted := make(chan struct{})
 	svrCtxDone := make(chan struct{})
 
-	// Set up server and client manually to use SoftCancel: false on
-	// the client, matching CockroachDB's configuration.
+	// Set up server and client manually, matching CockroachDB's configuration.
 	c1, c2 := net.Pipe()
 	defer func() { _ = c1.Close() }()
 	defer func() { _ = c2.Close() }()
@@ -194,13 +191,10 @@ func TestTransport_ClosedWhileHandlerBlockedBeforeRecv(t *testing.T) {
 	srv := drpcserver.New(mux)
 	ctx.Run(func(ctx context.Context) { _ = srv.ServeOne(ctx, c1) })
 
-	// Client connection with SoftCancel: false. When the client
-	// context is canceled, manageStream calls stream.Cancel() and
-	// then m.terminate() which closes the transport — the same
-	// code path as CockroachDB's delegate cancellation.
-	conn := drpcconn.NewWithOptions(c2, drpcconn.Options{
-		Manager: drpcmanager.Options{SoftCancel: false},
-	})
+	// Client connection. When the client context is canceled,
+	// manageStream calls stream.Cancel() and sends a cancel frame
+	// to the remote side.
+	conn := drpcconn.NewWithOptions(c2, drpcconn.Options{})
 	defer func() { _ = conn.Close() }()
 
 	// Create a cancelable context for the client RPC, simulating
@@ -233,20 +227,17 @@ func TestTransport_ClosedWhileHandlerBlockedBeforeRecv(t *testing.T) {
 
 	// Cancel the client RPC context. This triggers:
 	//   manageStream detects ctx.Done()
-	//   → stream.Cancel(ctx.Err()) returns false (not finished)
-	//   → m.terminate(ctx.Err())
-	//   → m.tr.Close() closes the transport
-	// This is the same code path as CockroachDB's delegate
-	// cancellation closing the TCP connection to the receiver.
+	//   → stream.Cancel(ctx.Err())
+	//   → sendStreamCancel() sends a KindCancel frame to the remote
+	// The server receives the cancel frame and terminates the stream.
 	cancel()
 
 	// The server handler's stream context should be canceled.
 	select {
 	case <-svrCtxDone:
-		// Transport closure propagated to the handler.
+		// Cancel frame propagated to the handler.
 	case <-time.After(5 * time.Second):
-		t.Fatal("deadlock: server handler's stream context was not " +
-			"canceled after client transport closed; manageReader is " +
-			"stuck in packetBuffer.Put()")
+		t.Fatal("server handler's stream context was not " +
+			"canceled after client sent cancel frame")
 	}
 }

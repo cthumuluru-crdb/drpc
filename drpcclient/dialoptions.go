@@ -91,7 +91,9 @@ func WithContextDialer(dialer func(context.Context, string) (net.Conn, error)) D
 	}
 }
 
-func DialContext(ctx context.Context, address string, opts ...DialOption) (conn *drpcconn.Conn, err error) {
+func DialContext(
+	ctx context.Context, address string, opts ...DialOption,
+) (conn *drpcconn.Conn, err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 
 	var options dialOptions
@@ -142,7 +144,6 @@ func DialContext(ctx context.Context, address string, opts ...DialOption) (conn 
 			Stream: drpcstream.Options{
 				MaximumBufferSize: 0, // unlimited
 			},
-			SoftCancel: false,
 		},
 		Metrics: options.metrics,
 	}), nil

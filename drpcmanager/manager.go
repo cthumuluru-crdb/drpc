@@ -35,13 +35,6 @@ type Options struct {
 	// Stream are passed to any streams the manager creates.
 	Stream drpcstream.Options
 
-	// SoftCancel controls if a context cancel will cause the transport to be
-	// closed or, if true, a soft cancel message will be attempted if possible.
-	// A soft cancel can reduce the amount of closed and dialed connections at
-	// the potential cost of higher latencies if there is latent data still
-	// being flushed when the cancel happens.
-	SoftCancel bool
-
 	// InactivityTimeout is the amount of time the manager will wait for
 	// the first invoke frame from the remote side. If no invoke frame is
 	// received within this duration, the manager terminates. If zero or
@@ -329,32 +322,7 @@ func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
 
 	case <-ctx.Done():
 		m.log("CANCEL", stream.String)
-
-		// TODO(server): we have to remove soft cancel.
-		if m.opts.SoftCancel {
-			// attempt to send the soft cancel. if it fails or if the stream is
-			// busy sending something else, then we have to hard cancel.
-			if busy, err := stream.SendCancel(ctx.Err()); err != nil {
-				m.terminate(err)
-			} else if busy {
-				m.log("BUSY", stream.String)
-				m.terminate(ctx.Err())
-			}
-			stream.Cancel(ctx.Err())
-		} else {
-			// If the stream isn't already finished, we have to terminate the
-			// transport to do an active cancel. If it is already finished,
-			// there is no need.
-			if !stream.Cancel(ctx.Err()) {
-				m.log("UNFIN", stream.String)
-				m.terminate(ctx.Err())
-			} else {
-				m.log("CLEAN", stream.String)
-			}
-		}
-
-		// wait for the stream to finish before removing from registry.
-		<-stream.Finished()
+		stream.Cancel(ctx.Err())
 	}
 }
 
@@ -389,9 +357,9 @@ func (m *Manager) Close() error {
 func (m *Manager) NewClientStream(
 	ctx context.Context, rpc string,
 ) (stream *drpcstream.Stream, err error) {
-	if err := ctx.Err(); err != nil {
+	if err, ok := m.sigs.term.Get(); ok {
 		return nil, err
-	} else if err, ok := m.sigs.term.Get(); ok {
+	} else if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 

@@ -5,6 +5,7 @@ package drpcmanager
 
 import (
 	"context"
+	"io"
 	"testing"
 
 	"github.com/zeebo/assert"
@@ -13,7 +14,7 @@ import (
 )
 
 func testStream(id uint64) *drpcstream.Stream {
-	return drpcstream.New(context.Background(), id, &drpcwire.Writer{})
+	return drpcstream.New(context.Background(), id, drpcwire.NewWriter(io.Discard, 0))
 }
 
 // testActiveStreams returns an activeStreams with fresh term and tport signals.

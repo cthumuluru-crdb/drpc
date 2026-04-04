@@ -46,8 +46,8 @@ type Stream struct {
 	opts Options
 	task *trace.Task
 
-	write inspectMutex
-	read  inspectMutex
+	write sync.Mutex
+	read  sync.Mutex
 	flush sync.Once
 
 	pa drpcwire.PacketAssembler
@@ -101,7 +101,7 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts O
 		task: task,
 		pa:   pa,
 		id:   drpcwire.ID{Stream: sid},
-		wr:   wr.Reset(),
+		wr:   wr,
 	}
 
 	// initialize the packet buffer
@@ -296,21 +296,6 @@ func (s *Stream) handlePacket(pkt drpcwire.Packet) (err error) {
 // helpers
 //
 
-// checkFinished checks to see if the stream is terminated, and if so, sets the
-// finished flag. This must be called after every read or write is complete, as
-// well as when the stream becomes terminated.
-func (s *Stream) checkFinished() {
-	if s.sigs.term.IsSet() && s.write.Unlocked() && s.read.Unlocked() {
-		if s.sigs.fin.Set(nil) {
-			s.log("FIN", func() string { return "" })
-			s.ctx.sig.Set(context.Canceled)
-			if s.task != nil {
-				s.task.End()
-			}
-		}
-	}
-}
-
 // checkCancelError will replace the error with one from the cancel signal if it
 // is set. This is to prevent errors from reads/writes to a transport after it
 // has been asynchronously closed due to context cancelation.
@@ -357,14 +342,21 @@ func (s *Stream) terminateIfBothClosed() {
 	}
 }
 
-// terminate marks the stream as terminated with the given error. It also marks
-// the stream as finished if no writes are happening at the time of the call.
+// terminate marks the stream as terminated with the given error and fires the
+// finished signal. With multiplexing, there is no need to wait for in-flight
+// I/O to drain — the stream is done immediately.
 func (s *Stream) terminate(err error) {
 	s.sigs.send.Set(err)
 	s.sigs.recv.Set(err)
 	s.sigs.term.Set(err)
 	s.pbuf.Close(err)
-	s.checkFinished()
+	if s.sigs.fin.Set(nil) {
+		s.log("FIN", func() string { return "" })
+		s.ctx.sig.Set(context.Canceled)
+		if s.task != nil {
+			s.task.End()
+		}
+	}
 }
 
 //
@@ -373,7 +365,7 @@ func (s *Stream) terminate(err error) {
 
 // RawWrite sends the data bytes with the given kind.
 func (s *Stream) RawWrite(kind drpcwire.Kind, data []byte) (err error) {
-	defer s.checkFinished()
+
 	s.write.Lock()
 	defer s.write.Unlock()
 
@@ -411,7 +403,7 @@ func (s *Stream) rawWriteLocked(kind drpcwire.Kind, data []byte) (err error) {
 
 // RawFlush flushes any buffers of data.
 func (s *Stream) RawFlush() (err error) {
-	defer s.checkFinished()
+
 	s.write.Lock()
 	defer s.write.Unlock()
 
@@ -461,7 +453,6 @@ func (s *Stream) RawRecv() (data []byte, err error) {
 		return nil, err
 	}
 
-	defer s.checkFinished()
 	s.read.Lock()
 	defer s.read.Unlock()
 
@@ -485,7 +476,6 @@ func (s *Stream) MsgSend(msg drpc.Message, enc drpc.Encoding) (err error) {
 
 	s.flush.Do(func() {})
 
-	defer s.checkFinished()
 	s.write.Lock()
 	defer s.write.Unlock()
 
@@ -513,7 +503,6 @@ func (s *Stream) MsgRecv(msg drpc.Message, enc drpc.Encoding) (err error) {
 		return err
 	}
 
-	defer s.checkFinished()
 	s.read.Lock()
 	defer s.read.Unlock()
 
@@ -549,7 +538,6 @@ func (s *Stream) SendError(serr error) (err error) {
 		return nil
 	}
 
-	defer s.checkFinished()
 	s.write.Lock()
 	defer s.write.Unlock()
 
@@ -558,35 +546,6 @@ func (s *Stream) SendError(serr error) (err error) {
 	s.mu.Unlock()
 
 	return s.checkCancelError(s.sendPacketLocked(drpcwire.KindError, false, drpcwire.MarshalError(serr)))
-}
-
-// SendCancel transitions the stream into the canceled state with
-// context.Canceled and sends a cancel error to the remote side for a soft
-// cancel. It is a no-op if the stream is already terminated. It returns true
-// for busy if writes are already blocked and a hard cancel is required.
-func (s *Stream) SendCancel(err error) (busy bool, _ error) {
-	s.log("CALL", func() string { return "SendCancel()" })
-
-	s.mu.Lock()
-	if !s.write.Unlocked() { // if writes are happening, then we have to do a hard cancel.
-		s.mu.Unlock()
-		return true, nil
-	}
-
-	if s.sigs.term.IsSet() {
-		s.mu.Unlock()
-		return false, nil
-	}
-
-	defer s.checkFinished()
-	s.write.Lock()
-	defer s.write.Unlock()
-
-	s.sigs.send.Set(io.EOF) // in this state, gRPC returns io.EOF on send.
-	s.terminate(err)
-	s.mu.Unlock()
-
-	return false, s.checkCancelError(s.sendPacketLocked(drpcwire.KindCancel, true, nil))
 }
 
 // Close terminates the stream and sends that the stream has been closed to the
@@ -600,7 +559,6 @@ func (s *Stream) Close() (err error) {
 		return nil
 	}
 
-	defer s.checkFinished()
 	s.write.Lock()
 	defer s.write.Unlock()
 
@@ -622,7 +580,6 @@ func (s *Stream) CloseSend() (err error) {
 		return nil
 	}
 
-	defer s.checkFinished()
 	s.write.Lock()
 	defer s.write.Unlock()
 
@@ -634,20 +591,30 @@ func (s *Stream) CloseSend() (err error) {
 }
 
 // Cancel transitions the stream into a state where all writes to the transport will return
-// the provided error, and terminates the stream. It is a no-op if the stream is already
-// finished, and returns a boolean indicating if that was the case.
+// the provided error, terminates the stream, and sends a cancel frame to the remote side.
+// It is a no-op if the stream is already terminated, and returns a boolean indicating if
+// that was the case. The cancel signal is always set so that in-flight operations can
+// detect the cancellation via checkCancelError.
 func (s *Stream) Cancel(err error) bool {
 	s.log("CALL", func() string { return fmt.Sprintf("Cancel(%v)", err) })
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.sigs.cancel.Set(err)
 
-	if s.IsFinished() {
+	if s.sigs.term.IsSet() {
+		s.mu.Unlock()
 		return true
 	}
 
-	s.sigs.cancel.Set(err)
+	s.write.Lock()
+	defer s.write.Unlock()
+
 	s.sigs.send.Set(io.EOF) // in this state, gRPC returns io.EOF on send.
 	s.terminate(err)
+	s.mu.Unlock()
+
+	// Best-effort cancel frame to notify the remote side. Error is ignored
+	// because the stream is already terminated locally.
+	_ = s.sendPacketLocked(drpcwire.KindCancel, true, nil)
 	return false
 }
