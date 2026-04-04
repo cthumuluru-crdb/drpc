@@ -213,18 +213,26 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 		}
 		ps = eps
 	default:
-		// This is a new stream request. New stream IDs must be strictly
-		// increasing.
-		if fr.ID.Stream <= m.lastInvokeStreamID {
+		// This is a new stream request. With multiplexed streams, invoke
+		// frames may arrive out of order because concurrent goroutines
+		// race to write their invoke frames through the shared Writer.
+		// We only require that stream IDs haven't been seen before (no
+		// duplicates), not that they arrive in strictly increasing order.
+		if _, dup := m.pendingStreams[fr.ID.Stream]; dup {
 			return drpc.ProtocolError.New(
-				"invoke stream id monotonicity violation: got %d, expected > %d",
-				fr.ID.Stream, m.lastInvokeStreamID)
+				"duplicate invoke for stream id %d", fr.ID.Stream)
+		}
+		if _, active := m.activeStreams.Get(fr.ID.Stream); active {
+			return drpc.ProtocolError.New(
+				"invoke for already-active stream id %d", fr.ID.Stream)
 		}
 
 		ps = &pendingStream{}
 		ps.pa.SetStreamID(fr.ID.Stream)
 		m.pendingStreams[fr.ID.Stream] = ps
-		m.lastInvokeStreamID = fr.ID.Stream
+		if fr.ID.Stream > m.lastInvokeStreamID {
+			m.lastInvokeStreamID = fr.ID.Stream
+		}
 	}
 
 	pkt, packetReady, err := ps.pa.AppendFrame(fr)

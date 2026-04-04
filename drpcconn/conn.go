@@ -74,7 +74,9 @@ func (c *Conn) Close() (err error) { return c.man.Close() }
 // Invoke issues the rpc on the transport serializing in, waits for a response, and
 // deserializes it into out. Multiple Invoke or NewStream calls may be open concurrently
 // when the manager supports multiplexing.
-func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) (err error) {
+func (c *Conn) Invoke(
+	ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message,
+) (err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 
 	var metadata []byte
@@ -100,7 +102,14 @@ func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, ou
 	return nil
 }
 
-func (c *Conn) doInvoke(stream *drpcstream.Stream, enc drpc.Encoding, rpc string, data []byte, metadata []byte, out drpc.Message) (err error) {
+func (c *Conn) doInvoke(
+	stream *drpcstream.Stream,
+	enc drpc.Encoding,
+	rpc string,
+	data []byte,
+	metadata []byte,
+	out drpc.Message,
+) (err error) {
 	if len(metadata) > 0 {
 		if err := stream.RawWrite(drpcwire.KindInvokeMetadata, metadata); err != nil {
 			return err
@@ -123,7 +132,9 @@ func (c *Conn) doInvoke(stream *drpcstream.Stream, enc drpc.Encoding, rpc string
 
 // NewStream begins a streaming rpc on the connection. Multiple Invoke or NewStream
 // calls may be open concurrently when the manager supports multiplexing.
-func (c *Conn) NewStream(ctx context.Context, rpc string, enc drpc.Encoding) (_ drpc.Stream, err error) {
+func (c *Conn) NewStream(
+	ctx context.Context, rpc string, enc drpc.Encoding,
+) (_ drpc.Stream, err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 
 	var metadata []byte
@@ -153,7 +164,7 @@ func (c *Conn) doNewStream(stream *drpcstream.Stream, rpc string, metadata []byt
 	if err := stream.RawWrite(drpcwire.KindInvoke, []byte(rpc)); err != nil {
 		return err
 	}
-	return nil
+	return stream.RawFlush()
 }
 
 // encodeMetadata retrieves and encodes metadata from the provided

@@ -48,7 +48,6 @@ type Stream struct {
 
 	write sync.Mutex
 	read  sync.Mutex
-	flush sync.Once
 
 	pa drpcwire.PacketAssembler
 
@@ -421,8 +420,6 @@ func (s *Stream) rawFlushLocked() (err error) {
 	switch {
 	case s.sigs.cancel.IsSet():
 		return s.sigs.cancel.Err()
-	case s.sigs.send.IsSet():
-		return s.sigs.send.Err()
 	case s.sigs.term.IsSet():
 		return s.sigs.term.Err()
 	}
@@ -432,27 +429,8 @@ func (s *Stream) rawFlushLocked() (err error) {
 	return s.checkCancelError(errs.Wrap(s.wr.Flush()))
 }
 
-func (s *Stream) checkRecvFlush() (err error) {
-	s.flush.Do(func() { err = s.RawFlush() })
-	if err != nil {
-		return err
-	}
-
-	if s.opts.ManualFlush && !s.wr.Empty() {
-		if err := s.RawFlush(); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
 // RawRecv returns the raw bytes received for a message.
 func (s *Stream) RawRecv() (data []byte, err error) {
-	if err := s.checkRecvFlush(); err != nil {
-		return nil, err
-	}
-
 	s.read.Lock()
 	defer s.read.Unlock()
 
@@ -473,8 +451,6 @@ func (s *Stream) RawRecv() (data []byte, err error) {
 // MsgSend marshals the message with the encoding, writes it, and flushes.
 func (s *Stream) MsgSend(msg drpc.Message, enc drpc.Encoding) (err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
-
-	s.flush.Do(func() {})
 
 	s.write.Lock()
 	defer s.write.Unlock()
@@ -498,10 +474,6 @@ func (s *Stream) MsgSend(msg drpc.Message, enc drpc.Encoding) (err error) {
 // MsgRecv recives some message data and unmarshals it with enc into msg.
 func (s *Stream) MsgRecv(msg drpc.Message, enc drpc.Encoding) (err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
-
-	if err := s.checkRecvFlush(); err != nil {
-		return err
-	}
 
 	s.read.Lock()
 	defer s.read.Unlock()

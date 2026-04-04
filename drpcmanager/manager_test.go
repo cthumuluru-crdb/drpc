@@ -6,8 +6,10 @@ package drpcmanager
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -305,8 +307,9 @@ func TestManageReader_CrossStreamFramesIgnored(t *testing.T) {
 	assert.DeepEqual(t, data, []byte("fresh"))
 }
 
-// Invoke stream ID regression: after invoking stream 2, an invoke for stream 1
-// is rejected by the invoke stream ID monotonicity check.
+// Out-of-order invoke: after invoking stream 2, an invoke for stream 1
+// is accepted because multiplexed clients may write invoke frames
+// out of order due to concurrent goroutine scheduling.
 func TestManageReader_InvokeStreamIDRegression(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
 	defer ctx.Close()
@@ -340,13 +343,15 @@ func TestManageReader_InvokeStreamIDRegression(t *testing.T) {
 	stream2.Cancel(context.Canceled)
 	<-stream2.Finished()
 
-	// Now send an invoke for stream 1 (lower than 2). This should terminate
-	// the manager with a protocol error.
+	// Send an invoke for stream 1 (lower than 2). With multiplexing,
+	// this is valid — concurrent goroutines may write invoke frames
+	// out of order. The manager should accept it and create a new stream.
 	writeFrames(t, cconn,
 		createFrame(drpcwire.KindInvoke, 1, 1, "rpc1", true),
 	)
 
-	waitForClosed(t, man)
+	stream1, _ := recv.get(t)
+	assert.Equal(t, stream1.ID(), uint64(1))
 }
 
 // Invoke replay: a second invoke for the same stream ID is delivered to the
@@ -925,4 +930,404 @@ func TestManageStream_CancelSendsFrame(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for cancel frame")
 	}
+}
+
+// Canceling one stream while a sibling is actively writing must not corrupt
+// or lose the sibling's data.
+func TestManageStream_CancelWhileSiblingWrites(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	cman := New(cconn)
+	defer func() { _ = cman.Close() }()
+
+	const numMessages = 50
+
+	// Read all frames on the server side. Frame.Data aliases the reader's
+	// internal buffer, so we must copy it before sending on the channel.
+	type frameResult struct {
+		fr  drpcwire.Frame
+		err error
+	}
+	frames := make(chan frameResult, 200)
+	ctx.Run(func(ctx context.Context) {
+		rd := drpcwire.NewReader(sconn)
+		for {
+			fr, err := rd.ReadFrame()
+			fr.Data = append([]byte(nil), fr.Data...)
+			frames <- frameResult{fr, err}
+			if err != nil {
+				return
+			}
+		}
+	})
+
+	// Create stream 1 (will be canceled) and stream 2 (will write data).
+	ctx1, cancel1 := context.WithCancel(ctx)
+	stream1, err := cman.NewClientStream(ctx1, "rpc1")
+	assert.NoError(t, err)
+	assert.NoError(t, stream1.RawWrite(drpcwire.KindInvoke, []byte("rpc1")))
+	assert.NoError(t, stream1.RawFlush())
+
+	stream2, err := cman.NewClientStream(ctx, "rpc2")
+	assert.NoError(t, err)
+	assert.NoError(t, stream2.RawWrite(drpcwire.KindInvoke, []byte("rpc2")))
+	assert.NoError(t, stream2.RawFlush())
+
+	// Start writing on stream 2 concurrently.
+	writeDone := make(chan struct{})
+	ctx.Run(func(_ context.Context) {
+		defer close(writeDone)
+		for i := 0; i < numMessages; i++ {
+			msg := fmt.Sprintf("msg-%d", i)
+			if err := stream2.RawWrite(drpcwire.KindMessage, []byte(msg)); err != nil {
+				return
+			}
+			if err := stream2.RawFlush(); err != nil {
+				return
+			}
+		}
+		_ = stream2.Close()
+	})
+
+	// Cancel stream 1 while stream 2 is writing.
+	time.Sleep(5 * time.Millisecond)
+	cancel1()
+
+	// Wait for stream 2's writes to finish.
+	<-writeDone
+
+	// Collect frames by stream ID.
+	got := make(map[uint64][]drpcwire.Frame)
+	timeout := time.After(5 * time.Second)
+	for done := false; !done; {
+		select {
+		case r := <-frames:
+			if r.err != nil {
+				done = true
+				break
+			}
+			got[r.fr.ID.Stream] = append(got[r.fr.ID.Stream], r.fr)
+			// Stop once we see the Close frame from stream 2.
+			if r.fr.ID.Stream == stream2.ID() && r.fr.Kind == drpcwire.KindClose {
+				done = true
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for frames")
+		}
+	}
+
+	// Verify all messages from stream 2 arrived (invoke + N messages + close).
+	s2Frames := got[stream2.ID()]
+	var msgCount int
+	for _, fr := range s2Frames {
+		if fr.Kind == drpcwire.KindMessage {
+			msgCount++
+		}
+	}
+	assert.Equal(t, msgCount, numMessages)
+
+	// Manager should still be alive.
+	assert.That(t, !closed(cman.Closed()))
+}
+
+// Multiple streams writing concurrently must not corrupt each other's data.
+// Frames may interleave but per-stream ordering must be preserved.
+func TestManageStream_ConcurrentWrites(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	cman := New(cconn)
+	defer func() { _ = cman.Close() }()
+
+	const (
+		numStreams   = 5
+		numPerStream = 50
+	)
+
+	// Collect all frames on server side. Frame.Data aliases the reader's
+	// internal buffer, so we must copy it before sending on the channel.
+	type frameResult struct {
+		fr  drpcwire.Frame
+		err error
+	}
+	allFrames := make(chan frameResult, numStreams*(numPerStream+2)*2)
+	ctx.Run(func(ctx context.Context) {
+		rd := drpcwire.NewReader(sconn)
+		for {
+			fr, err := rd.ReadFrame()
+			fr.Data = append([]byte(nil), fr.Data...)
+			allFrames <- frameResult{fr, err}
+			if err != nil {
+				return
+			}
+		}
+	})
+
+	// Create streams and build a map from stream ID to index.
+	streams := make([]*drpcstream.Stream, numStreams)
+	idToIdx := make(map[uint64]int)
+	for i := 0; i < numStreams; i++ {
+		s, err := cman.NewClientStream(ctx, fmt.Sprintf("rpc%d", i))
+		assert.NoError(t, err)
+		assert.NoError(t, s.RawWrite(drpcwire.KindInvoke, []byte(fmt.Sprintf("rpc%d", i))))
+		assert.NoError(t, s.RawFlush())
+		streams[i] = s
+		idToIdx[s.ID()] = i
+	}
+
+	// Write concurrently from each stream.
+	var wg sync.WaitGroup
+	wg.Add(numStreams)
+	for i := 0; i < numStreams; i++ {
+		go func(s *drpcstream.Stream, idx int) {
+			defer wg.Done()
+			for j := 0; j < numPerStream; j++ {
+				msg := fmt.Sprintf("s%d-m%d", idx, j)
+				_ = s.RawWrite(drpcwire.KindMessage, []byte(msg))
+				_ = s.RawFlush()
+			}
+			_ = s.Close()
+		}(streams[i], i)
+	}
+	wg.Wait()
+
+	// Collect frames by stream ID.
+	got := make(map[uint64][]string)
+	closesSeen := 0
+	timeout := time.After(5 * time.Second)
+	for closesSeen < numStreams {
+		select {
+		case r := <-allFrames:
+			if r.err != nil {
+				t.Fatalf("unexpected read error: %v", r.err)
+			}
+			if r.fr.Kind == drpcwire.KindMessage {
+				got[r.fr.ID.Stream] = append(got[r.fr.ID.Stream], string(r.fr.Data))
+			}
+			if r.fr.Kind == drpcwire.KindClose {
+				closesSeen++
+			}
+		case <-timeout:
+			t.Fatalf("timed out: got %d/%d closes", closesSeen, numStreams)
+		}
+	}
+
+	// Verify each stream got all messages in order.
+	for sid, msgs := range got {
+		idx := idToIdx[sid]
+		assert.Equal(t, len(msgs), numPerStream)
+		for j, msg := range msgs {
+			assert.Equal(t, msg, fmt.Sprintf("s%d-m%d", idx, j))
+		}
+	}
+}
+
+// Rapid create-cancel-create cycles must not leak goroutines or corrupt the
+// manager's stream registry.
+func TestManageStream_RapidCreateCancel(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	cman := New(cconn)
+	defer func() { _ = cman.Close() }()
+
+	// Drain frames on server side.
+	ctx.Run(func(ctx context.Context) {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := sconn.Read(buf); err != nil {
+				return
+			}
+		}
+	})
+
+	const iterations = 100
+
+	for i := 0; i < iterations; i++ {
+		subctx, cancel := context.WithCancel(ctx)
+		stream, err := cman.NewClientStream(subctx, fmt.Sprintf("rpc%d", i))
+		assert.NoError(t, err)
+		assert.NoError(t, stream.RawWrite(drpcwire.KindInvoke, []byte("rpc")))
+		assert.NoError(t, stream.RawFlush())
+		cancel()
+		<-stream.Finished()
+	}
+
+	// Manager must still be alive after all the churn.
+	assert.That(t, !closed(cman.Closed()))
+
+	// Create one final stream to verify the manager is fully functional.
+	stream, err := cman.NewClientStream(ctx, "final")
+	assert.NoError(t, err)
+	assert.NoError(t, stream.RawWrite(drpcwire.KindInvoke, []byte("final")))
+	assert.NoError(t, stream.RawWrite(drpcwire.KindMessage, []byte("hello")))
+	assert.NoError(t, stream.RawFlush())
+	assert.NoError(t, stream.Close())
+}
+
+// Canceling a client stream during active server-side streaming must
+// propagate the cancel frame and terminate the server handler's stream.
+func TestManageStream_CancelDuringServerStreaming(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	recv := newRecvStream()
+	sman := NewWithOptions(sconn, Options{ServerHandler: recv.handler})
+	defer func() { _ = sman.Close() }()
+
+	// Send invoke to create server stream 1.
+	writeFrames(t, cconn,
+		createFrame(drpcwire.KindInvoke, 1, 1, "rpc1", true),
+	)
+	sstream, _ := recv.get(t)
+
+	// Start draining client-side reads (server responses) in background.
+	// This must be running before the handler starts writing, otherwise
+	// net.Pipe's synchronous write blocks the handler.
+	msgSeen := make(chan struct{}, 100)
+	ctx.Run(func(_ context.Context) {
+		rd := drpcwire.NewReader(cconn)
+		for {
+			fr, err := rd.ReadFrame()
+			if err != nil {
+				return
+			}
+			if fr.Kind == drpcwire.KindMessage {
+				msgSeen <- struct{}{}
+			}
+		}
+	})
+
+	// Server handler sends messages until its stream terminates.
+	ctx.Run(func(_ context.Context) {
+		for i := 0; ; i++ {
+			msg := fmt.Sprintf("resp-%d", i)
+			if err := sstream.RawWrite(drpcwire.KindMessage, []byte(msg)); err != nil {
+				return
+			}
+			if err := sstream.RawFlush(); err != nil {
+				return
+			}
+		}
+	})
+
+	// Wait for a few messages to arrive, then send cancel.
+	for i := 0; i < 3; i++ {
+		<-msgSeen
+	}
+
+	writeFrames(t, cconn,
+		createFrame(drpcwire.KindCancel, 1, 100, "", true),
+	)
+
+	// Server handler's stream context must be canceled.
+	select {
+	case <-sstream.Context().Done():
+		// Good — cancel propagated.
+	case <-time.After(5 * time.Second):
+		t.Fatal("server stream context was not canceled")
+	}
+
+	// Server manager should still be alive.
+	assert.That(t, !closed(sman.Closed()))
+
+	// A new stream should work on the same server manager.
+	writeFrames(t, cconn,
+		createFrame(drpcwire.KindInvoke, 2, 1, "rpc2", true),
+		createFrame(drpcwire.KindMessage, 2, 2, "data", true),
+	)
+	sstream2, _ := recv.get(t)
+	data, err := sstream2.RawRecv()
+	assert.NoError(t, err)
+	assert.DeepEqual(t, data, []byte("data"))
+}
+
+// 50 concurrent server streams must all receive their data correctly,
+// testing the registry and handler dispatch under load.
+func TestManageStream_FanOut(t *testing.T) {
+	ctx := drpctest.NewTracker(t)
+	defer ctx.Close()
+
+	cconn, sconn := net.Pipe()
+	defer func() { _ = cconn.Close() }()
+	defer func() { _ = sconn.Close() }()
+
+	const numStreams = 50
+
+	recv := newRecvStream()
+	sman := NewWithOptions(sconn, Options{ServerHandler: recv.handler})
+	defer func() { _ = sman.Close() }()
+
+	// Drain server-side writes so nothing blocks.
+	ctx.Run(func(ctx context.Context) {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := cconn.Read(buf); err != nil {
+				return
+			}
+		}
+	})
+
+	// Send invokes and messages for all streams.
+	for i := uint64(1); i <= numStreams; i++ {
+		writeFrames(t, cconn,
+			createFrame(drpcwire.KindInvoke, i, 1, fmt.Sprintf("rpc%d", i), true),
+			createFrame(drpcwire.KindMessage, i, 2, fmt.Sprintf("req-%d", i), true),
+		)
+	}
+
+	// Collect received data from all handler goroutines.
+	type result struct {
+		streamID uint64
+		data     string
+		err      error
+	}
+	results := make(chan result, numStreams)
+	for i := 0; i < numStreams; i++ {
+		ctx.Run(func(_ context.Context) {
+			stream, _ := recv.get(t)
+			data, err := stream.RawRecv()
+			results <- result{stream.ID(), string(data), err}
+			stream.Cancel(nil)
+		})
+	}
+
+	// Verify all streams received correct data.
+	got := make(map[uint64]string)
+	timeout := time.After(5 * time.Second)
+	for i := 0; i < numStreams; i++ {
+		select {
+		case r := <-results:
+			if r.err != nil {
+				t.Fatalf("stream %d recv error: %v", r.streamID, r.err)
+			}
+			got[r.streamID] = r.data
+		case <-timeout:
+			t.Fatalf("timed out: got %d/%d results", i, numStreams)
+		}
+	}
+
+	for i := uint64(1); i <= numStreams; i++ {
+		assert.Equal(t, got[i], fmt.Sprintf("req-%d", i))
+	}
+
+	// Server manager must still be alive.
+	assert.That(t, !closed(sman.Closed()))
 }
