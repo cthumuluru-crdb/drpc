@@ -5,13 +5,9 @@ package drpcmanager
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/zeebo/errs"
@@ -171,9 +167,10 @@ func (m *Manager) manageReader() {
 	for !m.sigs.term.IsSet() {
 		incomingFrame, err := m.rd.ReadFrame()
 		if err != nil {
-			if isConnectionReset(err) {
-				err = drpc.ClosedError.Wrap(err)
-			}
+			// Any read error means the transport is broken. Wrap with
+			// ClosedError so that ToRPCErr maps it to codes.Unavailable,
+			// matching gRPC's behavior for transport read failures.
+			err = drpc.ClosedError.Wrap(err)
 			m.terminate(managerClosed.Wrap(err))
 			return
 		}
@@ -265,7 +262,7 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 	}
 	ctx := m.opts.ServerContext
 	if ctx == nil {
-		return drpc.InternalError.New("server base context is nil")
+		ctx = context.Background()
 	}
 
 	if ps.metadata != nil {
@@ -407,25 +404,4 @@ func (m *Manager) NewClientStream(
 	go m.manageStream(ctx, stream)
 
 	return stream, nil
-}
-
-func isConnectionReset(err error) bool {
-	var operr *net.OpError
-	if !errors.As(err, &operr) {
-		return false
-	}
-	if errors.Is(operr.Err, syscall.ECONNRESET) {
-		return true
-	}
-	msg := strings.ToLower(operr.Err.Error())
-	if strings.Contains(msg, "connection reset by peer") {
-		return true
-	}
-	if strings.Contains(msg, "connection was forcibly closed by the remote host") {
-		return true
-	}
-	if strings.Contains(msg, strings.ToLower(syscall.ECONNRESET.Error())) {
-		return true
-	}
-	return false
 }
