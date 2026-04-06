@@ -146,11 +146,13 @@ func TestConn_InvokeSendsGrpcAndDrpcMetadata(t *testing.T) {
 
 func TestConn_NewStreamSendsGrpcAndDrpcMetadata(t *testing.T) {
 	ctx := drpctest.NewTracker(t)
-	defer ctx.Close()
 
 	pc, ps := net.Pipe()
-	defer func() { assert.NoError(t, pc.Close()) }()
-	defer func() { assert.NoError(t, ps.Close()) }()
+	defer func() { _ = pc.Close() }()
+	defer func() { _ = ps.Close() }()
+	// Wait for goroutines before closing pipes. With async writes,
+	// the writer goroutine may not have flushed to the pipe yet.
+	defer ctx.Close()
 
 	ctx.Run(func(ctx context.Context) {
 		rd := drpcwire.NewReader(ps)

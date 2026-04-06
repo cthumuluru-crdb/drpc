@@ -14,7 +14,9 @@ import (
 )
 
 func testStream(id uint64) *drpcstream.Stream {
-	return drpcstream.New(context.Background(), id, drpcwire.NewWriter(io.Discard, 0))
+	mw := drpcwire.NewMuxWriter(io.Discard, 0, func(error) {})
+	fw := drpcwire.NewFrameWriter(mw)
+	return drpcstream.New(context.Background(), id, fw)
 }
 
 // testActiveStreams returns an activeStreams with fresh term and tport signals.

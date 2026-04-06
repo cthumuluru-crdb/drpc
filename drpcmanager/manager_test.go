@@ -1210,7 +1210,10 @@ func TestManageStream_CancelDuringServerStreaming(t *testing.T) {
 				return
 			}
 			if fr.Kind == drpcwire.KindMessage {
-				msgSeen <- struct{}{}
+				select {
+				case msgSeen <- struct{}{}:
+				default:
+				}
 			}
 		}
 	})

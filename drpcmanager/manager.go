@@ -65,7 +65,7 @@ type Options struct {
 // to the appropriate stream.
 type Manager struct {
 	tr   drpc.Transport
-	wr   *drpcwire.Writer
+	mw   *drpcwire.MuxWriter
 	rd   *drpcwire.Reader
 	opts Options
 
@@ -107,10 +107,13 @@ func New(tr drpc.Transport) *Manager {
 func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 	m := &Manager{
 		tr:   tr,
-		wr:   drpcwire.NewWriter(tr, opts.WriterBufferSize),
 		rd:   drpcwire.NewReaderWithOptions(tr, opts.Reader),
 		opts: opts,
 	}
+
+	m.mw = drpcwire.NewMuxWriter(tr, opts.WriterBufferSize, func(err error) {
+		m.terminate(managerClosed.Wrap(err))
+	})
 
 	m.pendingStreams = make(map[uint64]*pendingStream)
 	m.activeStreams = newActiveStreams(&m.sigs.term, &m.sigs.tport)
@@ -141,6 +144,7 @@ func (m *Manager) log(what string, cb func() string) {
 func (m *Manager) terminate(err error) {
 	if m.sigs.term.Set(err) {
 		m.log("TERM", func() string { return fmt.Sprint(err) })
+		m.mw.Stop(err)
 		m.sigs.tport.Set(m.tr.Close())
 		m.activeStreams.Close(err)
 	}
@@ -309,7 +313,8 @@ func (m *Manager) newStream(
 		drpcopts.SetStreamStats(&opts.Internal, cb(rpc))
 	}
 
-	stream := drpcstream.NewWithOptions(ctx, sid, m.wr, opts)
+	fw := drpcwire.NewFrameWriter(m.mw)
+	stream := drpcstream.NewWithOptions(ctx, sid, fw, opts)
 	if err := m.activeStreams.Add(sid, stream); err != nil {
 		return nil, err
 	}
@@ -354,7 +359,8 @@ func (m *Manager) Unblocked() <-chan struct{} {
 func (m *Manager) Close() error {
 	m.terminate(managerClosed.New("Close called"))
 
-	m.wg.Wait() // wait for all stream goroutines
+	m.wg.Wait()   // wait for all stream goroutines
+	<-m.mw.Done() // wait for writer goroutine to exit
 	m.sigs.read.Wait()
 	m.sigs.tport.Wait()
 

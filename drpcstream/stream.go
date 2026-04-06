@@ -52,7 +52,7 @@ type Stream struct {
 	pa drpcwire.PacketAssembler
 
 	id   drpcwire.ID
-	wr   *drpcwire.Writer
+	fw   *drpcwire.FrameWriter
 	pbuf *spscQueue
 	wbuf []byte
 
@@ -69,17 +69,19 @@ type Stream struct {
 var _ drpc.Stream = (*Stream)(nil)
 
 // New returns a new stream bound to the context with the given stream id and
-// will use the writer to write messages on. It is important use monotonically
+// will use the FrameWriter to write messages on. It is important use monotonically
 // increasing stream ids within a single transport.
-func New(ctx context.Context, sid uint64, wr *drpcwire.Writer) *Stream {
-	return NewWithOptions(ctx, sid, wr, Options{})
+func New(ctx context.Context, sid uint64, fw *drpcwire.FrameWriter) *Stream {
+	return NewWithOptions(ctx, sid, fw, Options{})
 }
 
 // NewWithOptions returns a new stream bound to the context with the given
-// stream id and will use the writer to write messages on. It is important use
+// stream id and will use the FrameWriter to write messages on. It is important use
 // monotonically increasing stream ids within a single transport. The options
 // are used to control details of how the Stream operates.
-func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts Options) *Stream {
+func NewWithOptions(
+	ctx context.Context, sid uint64, fw *drpcwire.FrameWriter, opts Options,
+) *Stream {
 	var task *trace.Task
 	if trace.IsEnabled() {
 		kind, rpc := drpcopts.GetStreamKind(&opts.Internal), drpcopts.GetStreamRPC(&opts.Internal)
@@ -100,7 +102,7 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts O
 		task: task,
 		pa:   pa,
 		id:   drpcwire.ID{Stream: sid},
-		wr:   wr,
+		fw:   fw,
 	}
 
 	// initialize the packet buffer
@@ -324,12 +326,10 @@ func (s *Stream) sendPacketLocked(kind drpcwire.Kind, control bool, data []byte)
 	drpcopts.GetStreamStats(&s.opts.Internal).AddWritten(uint64(len(data)))
 	s.log("SEND", fr.String)
 
-	if err := s.wr.WriteFrame(fr); err != nil {
+	if err := s.fw.WriteFrame(fr); err != nil {
 		return errs.Wrap(err)
 	}
-	if err := s.wr.Flush(); err != nil {
-		return errs.Wrap(err)
-	}
+	s.fw.Flush()
 	return nil
 }
 
@@ -392,7 +392,7 @@ func (s *Stream) rawWriteLocked(kind drpcwire.Kind, data []byte) (err error) {
 		drpcopts.GetStreamStats(&s.opts.Internal).AddWritten(uint64(len(fr.Data)))
 		s.log("SEND", fr.String)
 
-		if err := s.wr.WriteFrame(fr); err != nil {
+		if err := s.fw.WriteFrame(fr); err != nil {
 			return s.checkCancelError(errs.Wrap(err))
 		} else if fr.Done {
 			return nil
@@ -409,24 +409,17 @@ func (s *Stream) RawFlush() (err error) {
 	return s.rawFlushLocked()
 }
 
-// rawFlushLocked checks for any conditions that should cause a flush to not
-// happen and then issues the flush. It assumes the caller is holding the
-// appropriate locks.
+// rawFlushLocked notifies the writer goroutine to flush buffered data to the
+// transport. It is fire-and-forget: it returns immediately without waiting
+// for the I/O to complete. It assumes the caller is holding the appropriate
+// locks.
+//
+// No signal checks are needed here because flush is non-blocking and
+// harmless after the stream is closed. Write-side errors are caught in
+// rawWriteLocked; read-side errors come from pbuf.Dequeue.
 func (s *Stream) rawFlushLocked() (err error) {
-	if s.wr.Empty() {
-		return nil
-	}
-
-	switch {
-	case s.sigs.cancel.IsSet():
-		return s.sigs.cancel.Err()
-	case s.sigs.term.IsSet():
-		return s.sigs.term.Err()
-	}
-
-	s.log("FLUSH", func() string { return "" })
-
-	return s.checkCancelError(errs.Wrap(s.wr.Flush()))
+	s.fw.Flush()
+	return nil
 }
 
 // RawRecv returns the raw bytes received for a message.
