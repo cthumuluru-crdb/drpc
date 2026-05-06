@@ -164,7 +164,11 @@ func (s *Server) ServeOne(ctx context.Context, tr drpc.Transport) (err error) {
 		}
 	}
 
-	man := drpcmanager.NewWithOptions(tr, s.opts.Manager)
+	manOpts := s.opts.Manager
+	if manOpts.Logger == nil {
+		manOpts.Logger = s.opts.Logger
+	}
+	man := drpcmanager.NewWithOptions(tr, manOpts)
 	defer func() { err = errs.Combine(err, man.Close()) }()
 
 	cache := drpccache.New()

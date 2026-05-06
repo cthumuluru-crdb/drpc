@@ -25,6 +25,10 @@ type Options struct {
 	// Manager controls the options we pass to the manager of this conn.
 	Manager drpcmanager.Options
 
+	// Logger is used to log errors and operational events. If nil,
+	// drpc.DefaultLogger is used.
+	Logger drpc.Logger
+
 	// TODO: (server): deprecate this
 	// CollectStats controls whether the client should collect stats on the
 	// rpcs it creates.
@@ -77,6 +81,9 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Conn {
 		c.stats = make(map[string]*drpcstats.Stats)
 	}
 
+	if opts.Manager.Logger == nil {
+		opts.Manager.Logger = opts.Logger
+	}
 	c.man = drpcmanager.NewWithOptions(c.tr, opts.Manager)
 
 	return c
@@ -123,7 +130,9 @@ func (c *Conn) Close() (err error) { return c.man.Close() }
 
 // Invoke issues the rpc on the transport serializing in, waits for a response, and
 // deserializes it into out. Only one Invoke or Stream may be open at a time.
-func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) (err error) {
+func (c *Conn) Invoke(
+	ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message,
+) (err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 
 	var metadata []byte
@@ -155,7 +164,14 @@ func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, ou
 	return nil
 }
 
-func (c *Conn) doInvoke(stream *drpcstream.Stream, enc drpc.Encoding, rpc string, data []byte, metadata []byte, out drpc.Message) (err error) {
+func (c *Conn) doInvoke(
+	stream *drpcstream.Stream,
+	enc drpc.Encoding,
+	rpc string,
+	data []byte,
+	metadata []byte,
+	out drpc.Message,
+) (err error) {
 	if len(metadata) > 0 {
 		if err := stream.RawWrite(drpcwire.KindInvokeMetadata, metadata); err != nil {
 			return err
@@ -178,7 +194,9 @@ func (c *Conn) doInvoke(stream *drpcstream.Stream, enc drpc.Encoding, rpc string
 
 // NewStream begins a streaming rpc on the connection. Only one Invoke or Stream may
 // be open at a time.
-func (c *Conn) NewStream(ctx context.Context, rpc string, enc drpc.Encoding) (_ drpc.Stream, err error) {
+func (c *Conn) NewStream(
+	ctx context.Context, rpc string, enc drpc.Encoding,
+) (_ drpc.Stream, err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 
 	var metadata []byte

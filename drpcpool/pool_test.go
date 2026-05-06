@@ -646,6 +646,19 @@ func TestPoolMetrics_ShouldRecordDynamic(t *testing.T) {
 	assert.Equal(t, misses.total, 1.0) // unchanged
 }
 
+func TestPoolDefaultLogger(t *testing.T) {
+	pool := New[string, Conn](Options{})
+	defer func() { _ = pool.Close() }()
+	assert.Equal(t, pool.opts.Logger, drpc.DefaultLogger)
+}
+
+func TestPoolCustomLogger(t *testing.T) {
+	var logger drpc.InMemLogger
+	pool := New[string, Conn](Options{Logger: &logger})
+	defer func() { _ = pool.Close() }()
+	assert.Equal(t, pool.opts.Logger, &logger)
+}
+
 func BenchmarkPool(b *testing.B) {
 	ctx := drpctest.NewTracker(b)
 	defer ctx.Close()

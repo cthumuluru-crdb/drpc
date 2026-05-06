@@ -5,12 +5,11 @@ package drpcpool
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
 	"github.com/zeebo/errs"
-	"storj.io/drpc/drpcdebug"
+	"storj.io/drpc"
 	"storj.io/drpc/drpcmetrics"
 )
 
@@ -43,6 +42,10 @@ type Options struct {
 
 	// Labels holds optional labels to be attached to all metrics.
 	Labels map[string]string
+
+	// Logger is used to log operational events. If nil, drpc.DefaultLogger is
+	// used.
+	Logger drpc.Logger
 }
 
 // Pool is a connection pool with key type K. It maintains a cache of connections
@@ -58,6 +61,9 @@ type Pool[K comparable, V Conn] struct {
 
 // New constructs a new Pool with the provided Options.
 func New[K comparable, V Conn](opts Options) *Pool[K, V] {
+	if opts.Logger == nil {
+		opts.Logger = drpc.DefaultLogger
+	}
 	pool := Pool[K, V]{
 		opts:    opts,
 		entries: make(map[K]*list[K, V]),
@@ -112,8 +118,8 @@ func (p *Pool[K, V]) updatePoolSize() {
 }
 
 func (p *Pool[K, V]) log(what string, cb func() string) {
-	if drpcdebug.Enabled {
-		drpcdebug.Log(func() (_, _, _ string) { return fmt.Sprintf("<pül %p>", p), what, cb() })
+	if drpc.DebugEnabled {
+		p.opts.Logger.Debugf("<pool %p> %s %s", p, what, cb())
 	}
 }
 

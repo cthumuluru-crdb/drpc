@@ -183,6 +183,29 @@ func TestConn_NewStreamSendsGrpcAndDrpcMetadata(t *testing.T) {
 	_ = s.CloseSend()
 }
 
+func TestConnDefaultLogger(t *testing.T) {
+	pc, ps := net.Pipe()
+	defer func() { _ = pc.Close() }()
+	defer func() { _ = ps.Close() }()
+
+	conn := NewWithOptions(pc, Options{})
+	defer func() { _ = conn.Close() }()
+	// Verify construction with nil Logger does not panic.
+	_ = conn
+}
+
+func TestConnCustomLogger(t *testing.T) {
+	pc, ps := net.Pipe()
+	defer func() { _ = pc.Close() }()
+	defer func() { _ = ps.Close() }()
+
+	var logger drpc.InMemLogger
+	conn := NewWithOptions(pc, Options{Logger: &logger})
+	defer func() { _ = conn.Close() }()
+	// Verify construction with custom Logger does not panic.
+	_ = conn
+}
+
 func TestConn_encodeMetadata(t *testing.T) {
 	pc, ps := net.Pipe()
 	defer func() { assert.NoError(t, pc.Close()) }()

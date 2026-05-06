@@ -15,9 +15,7 @@ import (
 
 	"github.com/zeebo/errs"
 	grpcmetadata "google.golang.org/grpc/metadata"
-
 	"storj.io/drpc"
-	"storj.io/drpc/drpcdebug"
 	"storj.io/drpc/drpcmetadata"
 	"storj.io/drpc/drpcsignal"
 	"storj.io/drpc/drpcstream"
@@ -60,6 +58,10 @@ type Options struct {
 	// handling. When enabled, the server stream will decode incoming metadata
 	// into grpc metadata in the context.
 	GRPCMetadataCompatMode bool
+
+	// Logger is used to log operational events. If nil, drpc.DefaultLogger is
+	// used.
+	Logger drpc.Logger
 }
 
 // Manager handles the logic of managing a transport for a drpc client or
@@ -100,9 +102,13 @@ func New(tr drpc.Transport) *Manager {
 // NewWithOptions returns a new manager for the transport. It uses the provided
 // options to manage details of how it uses it.
 func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
+	if opts.Logger == nil {
+		opts.Logger = drpc.DefaultLogger
+	}
+
 	m := &Manager{
 		tr:   tr,
-		wr:   drpcwire.NewWriter(tr, opts.WriterBufferSize),
+		wr:   drpcwire.NewWriterWithLogger(tr, opts.WriterBufferSize, opts.Logger),
 		rd:   drpcwire.NewReaderWithOptions(tr, opts.Reader),
 		opts: opts,
 
@@ -135,8 +141,8 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 func (m *Manager) String() string { return fmt.Sprintf("<man %p>", m) }
 
 func (m *Manager) log(what string, cb func() string) {
-	if drpcdebug.Enabled {
-		drpcdebug.Log(func() (_, _, _ string) { return m.String(), what, cb() })
+	if drpc.DebugEnabled {
+		m.opts.Logger.Debugf("%s %s %s", m.String(), what, cb())
 	}
 }
 
@@ -298,8 +304,11 @@ func (m *Manager) manageReader() {
 //
 
 // newStream creates a stream value with the appropriate configuration for this manager.
-func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKind, rpc string) (*drpcstream.Stream, error) {
+func (m *Manager) newStream(
+	ctx context.Context, sid uint64, kind drpc.StreamKind, rpc string,
+) (*drpcstream.Stream, error) {
 	opts := m.opts.Stream
+	opts.Logger = m.opts.Logger
 	drpcopts.SetStreamKind(&opts.Internal, kind)
 	drpcopts.SetStreamRPC(&opts.Internal, rpc)
 	if cb := drpcopts.GetManagerStatsCB(&m.opts.Internal); cb != nil {
@@ -425,7 +434,9 @@ func (m *Manager) Close() error {
 }
 
 // NewClientStream starts a stream on the managed transport for use by a client.
-func (m *Manager) NewClientStream(ctx context.Context, rpc string) (stream *drpcstream.Stream, err error) {
+func (m *Manager) NewClientStream(
+	ctx context.Context, rpc string,
+) (stream *drpcstream.Stream, err error) {
 	if err := m.acquireSemaphore(ctx); err != nil {
 		return nil, err
 	}
@@ -436,7 +447,9 @@ func (m *Manager) NewClientStream(ctx context.Context, rpc string) (stream *drpc
 // NewServerStream starts a stream on the managed transport for use by a server.
 // It does this by waiting for the client to issue an invoke message and
 // returning the details.
-func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Stream, rpc string, err error) {
+func (m *Manager) NewServerStream(
+	ctx context.Context,
+) (stream *drpcstream.Stream, rpc string, err error) {
 	if err := m.acquireSemaphore(ctx); err != nil {
 		return nil, "", err
 	}

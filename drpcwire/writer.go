@@ -9,7 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"storj.io/drpc/drpcdebug"
+	"storj.io/drpc"
 )
 
 //
@@ -18,30 +18,40 @@ import (
 
 // Writer is a helper to buffer and write packets and frames to an io.Writer.
 type Writer struct {
-	empty uint32
-	w     io.Writer
-	size  int
-	mu    sync.Mutex
-	buf   []byte
+	empty  uint32
+	w      io.Writer
+	size   int
+	mu     sync.Mutex
+	buf    []byte
+	logger drpc.Logger
 }
 
 // NewWriter returns a Writer that will attempt to buffer size data before
 // sending it to the io.Writer.
 func NewWriter(w io.Writer, size int) *Writer {
+	return NewWriterWithLogger(w, size, drpc.DefaultLogger)
+}
+
+// NewWriterWithLogger returns a Writer that uses the provided Logger.
+func NewWriterWithLogger(w io.Writer, size int, logger drpc.Logger) *Writer {
 	if size == 0 {
 		size = 4 * 1024
 	}
+	if logger == nil {
+		logger = drpc.DefaultLogger
+	}
 
 	return &Writer{
-		w:    w,
-		size: size,
-		buf:  make([]byte, 0, size),
+		w:      w,
+		size:   size,
+		buf:    make([]byte, 0, size),
+		logger: logger,
 	}
 }
 
 func (b *Writer) log(what string, cb func() string) {
-	if drpcdebug.Enabled {
-		drpcdebug.Log(func() (_, _, _ string) { return fmt.Sprintf("<wri %p>", b), what, cb() })
+	if drpc.DebugEnabled {
+		b.logger.Debugf("<wri %p> %s %s", b, what, cb())
 	}
 }
 

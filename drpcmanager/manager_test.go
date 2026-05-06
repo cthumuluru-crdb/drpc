@@ -14,8 +14,8 @@ import (
 
 	"github.com/zeebo/assert"
 	grpcmetadata "google.golang.org/grpc/metadata"
+	"storj.io/drpc"
 	"storj.io/drpc/drpcmetadata"
-
 	"storj.io/drpc/drpctest"
 	"storj.io/drpc/drpcwire"
 )
@@ -295,3 +295,18 @@ func (b *blockedTransport) wait(p int, rw *bool) (int, error) {
 func (b *blockedTransport) Read(p []byte) (n int, err error)  { return b.wait(len(p), &b.ro) }
 func (b *blockedTransport) Write(p []byte) (n int, err error) { return b.wait(len(p), &b.wo) }
 func (b *blockedTransport) Close() error                      { return nil }
+
+func TestManagerDefaultLogger(t *testing.T) {
+	tr := make(blockingTransport)
+	man := New(tr)
+	defer func() { _ = man.Close() }()
+	assert.Equal(t, man.opts.Logger, drpc.DefaultLogger)
+}
+
+func TestManagerCustomLogger(t *testing.T) {
+	tr := make(blockingTransport)
+	var logger drpc.InMemLogger
+	man := NewWithOptions(tr, Options{Logger: &logger})
+	defer func() { _ = man.Close() }()
+	assert.Equal(t, man.opts.Logger, &logger)
+}

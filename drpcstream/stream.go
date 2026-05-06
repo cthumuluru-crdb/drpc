@@ -11,10 +11,8 @@ import (
 	"sync"
 
 	"github.com/zeebo/errs"
-
 	"storj.io/drpc"
 	"storj.io/drpc/drpcctx"
-	"storj.io/drpc/drpcdebug"
 	"storj.io/drpc/drpcenc"
 	"storj.io/drpc/drpcsignal"
 	"storj.io/drpc/drpcwire"
@@ -36,6 +34,10 @@ type Options struct {
 	// larger than this amount to control maximum memory usage at the expense of
 	// more allocations. 0 is unlimited.
 	MaximumBufferSize int
+
+	// Logger is used to log operational events. If nil, drpc.DefaultLogger is
+	// used.
+	Logger drpc.Logger
 
 	// Internal contains options that are for internal use only.
 	Internal drpcopts.Stream
@@ -89,6 +91,10 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.Writer, opts O
 		}
 	}
 
+	if opts.Logger == nil {
+		opts.Logger = drpc.DefaultLogger
+	}
+
 	s := &Stream{
 		ctx: streamCtx{
 			Context: ctx,
@@ -116,11 +122,14 @@ func (s *Stream) String() string {
 }
 
 func (s *Stream) log(what string, cb func() string) {
-	if drpcdebug.Enabled {
-		drpcdebug.Log(func() (_, _, _ string) { return s.String(), what, cb() })
-	}
-	if s.task != nil {
-		trace.Log(&s.ctx, what, cb())
+	if drpc.DebugEnabled || s.task != nil {
+		detail := cb()
+		if drpc.DebugEnabled {
+			s.opts.Logger.Debugf("%s %s %s", s.String(), what, detail)
+		}
+		if s.task != nil {
+			trace.Log(&s.ctx, what, detail)
+		}
 	}
 }
 

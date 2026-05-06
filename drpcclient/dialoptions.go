@@ -33,6 +33,9 @@ type dialOptions struct {
 	// tlsConfig is an optional TLS configuration for secure connections.
 	tlsConfig *tls.Config
 
+	// logger is used to log errors and operational events on the connection.
+	logger drpc.Logger
+
 	// metrics holds optional metrics the conn will populate. No metrics are
 	// recorded if this is nil. When shouldRecord is set, metrics are recorded
 	// only when shouldRecord returns true.
@@ -91,6 +94,13 @@ func WithMetrics(metrics *drpcmetrics.ClientMetrics) DialOption {
 func WithShouldRecordFunc(shouldRecord func() bool) DialOption {
 	return func(o *dialOptions) {
 		o.shouldRecord = shouldRecord
+	}
+}
+
+// WithLogger returns a DialOption that sets the Logger for the connection.
+func WithLogger(logger drpc.Logger) DialOption {
+	return func(o *dialOptions) {
+		o.logger = logger
 	}
 }
 
@@ -160,6 +170,7 @@ func DialContext(
 			},
 			SoftCancel: false,
 		},
+		Logger:       options.logger,
 		ShouldRecord: options.shouldRecord,
 		Metrics:      *options.metrics,
 	}), nil
