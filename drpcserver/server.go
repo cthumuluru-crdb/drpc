@@ -26,10 +26,9 @@ type Options struct {
 	// Manager controls the options we pass to the managers this server creates.
 	Manager drpcmanager.Options
 
-	// Log is called when errors happen that can not be returned up, like
-	// temporary network errors when accepting connections, or errors
-	// handling individual clients. It is not called if nil.
-	Log func(error)
+	// Logger is used to log errors and operational events. If nil,
+	// drpc.DefaultLogger is used.
+	Logger drpc.Logger
 
 	// CollectStats controls whether the server should collect stats on the
 	// rpcs it serves.
@@ -80,6 +79,10 @@ func New(handler drpc.Handler) *Server {
 // NewWithOptions constructs a new Server using the provided options to tune
 // how the drpc connections are handled.
 func NewWithOptions(handler drpc.Handler, opts Options) *Server {
+	if opts.Logger == nil {
+		opts.Logger = drpc.DefaultLogger
+	}
+
 	// Clone the TLS config so the server owns its copy and the caller cannot
 	// mutate it after construction.
 	if opts.TLSConfig != nil {
@@ -206,9 +209,7 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) (err error) {
 			}
 
 			if isTemporary(err) {
-				if s.opts.Log != nil {
-					s.opts.Log(err)
-				}
+				s.opts.Logger.Errorf("temporary accept error: %v", err)
 
 				t := time.NewTimer(temporarySleep)
 				select {
@@ -226,9 +227,8 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) (err error) {
 
 		// TODO(jeff): connection limits?
 		tracker.Run(func(ctx context.Context) {
-			err := s.ServeOne(ctx, conn)
-			if err != nil && s.opts.Log != nil {
-				s.opts.Log(err)
+			if err := s.ServeOne(ctx, conn); err != nil {
+				s.opts.Logger.Errorf("serving client: %v", err)
 			}
 		})
 	}
