@@ -210,6 +210,5 @@ DRPC is proud to get as much done in as few lines of code as possible. It's the 
 | storj.io/drpc/drpcctx                | 41       |
 | storj.io/drpc/internal/drpcopts      | 30       |
 | storj.io/drpc/drpcstats              | 25       |
-| storj.io/drpc/drpcdebug              | 22       |
 | storj.io/drpc/drpcenc                | 15       |
-| **Total**                            | **3611** |
+| **Total**                            | **3589** |
