@@ -168,7 +168,7 @@ func DialContext(
 			Stream: drpcstream.Options{
 				MaximumBufferSize: 0, // unlimited
 			},
-			SoftCancel: false,
+			SoftCancel: true,
 		},
 		Logger:       options.logger,
 		ShouldRecord: options.shouldRecord,

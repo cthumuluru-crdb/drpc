@@ -496,7 +496,6 @@ func (m *Manager) NewServerStream(
 
 			case drpcwire.KindInvoke:
 				rpc = string(pkt.Data)
-				m.pdone.Send()
 
 				if metaID == pkt.ID.Stream {
 					if m.opts.GRPCMetadataCompatMode {
@@ -515,6 +514,7 @@ func (m *Manager) NewServerStream(
 					}
 				}
 				stream, err := m.newStream(ctx, pkt.ID.Stream, drpc.StreamKindServer, rpc)
+				m.pdone.Send()
 				return stream, rpc, err
 
 			default:
