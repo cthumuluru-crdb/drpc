@@ -1,0 +1,9 @@
+ClusterSpec:
+  NodeCount: 6
+  CPUs: 8
+  Mem: "standard"
+
+StartOpts:
+  WaitForReplicationFactor: 3
+  RoachprodOpts:
+    ExtraArgs: []
