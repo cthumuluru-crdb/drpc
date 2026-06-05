@@ -3,7 +3,10 @@
 
 package drpcwire
 
-import "fmt"
+import (
+	"fmt"
+	"io"
+)
 
 //go:generate stringer -type=Kind -trimprefix=Kind -output=packet_string.go
 
@@ -122,6 +125,38 @@ func ParseFrame(buf []byte) (rem []byte, fr Frame, ok bool, err error) {
 	return rem, fr, true, nil
 bad:
 	return buf, fr, false, err
+}
+
+// WriteFrameTo writes a marshaled form of the frame to w, returning the total
+// bytes written. It uses two Write calls — one for the header (control byte +
+// varints) and one for the payload — so w should be buffered.
+func WriteFrameTo(w io.Writer, fr Frame) (int, error) {
+	control := byte(fr.Kind << 1)
+	if fr.Done {
+		control |= 0b00000001
+	}
+	if fr.Control {
+		control |= 0b10000000
+	}
+
+	// Build the header into a stack-allocated buffer.
+	// Max: 1 (control) + 10 (stream) + 10 (message) + 10 (data length) = 31 bytes.
+	var hdr [31]byte
+	h := AppendVarint(AppendVarint(AppendVarint(hdr[:1], fr.ID.Stream), fr.ID.Message), uint64(len(fr.Data)))
+	hdr[0] = control
+
+	total, err := w.Write(h)
+	if err != nil {
+		return total, err
+	}
+	if len(fr.Data) > 0 {
+		n, err := w.Write(fr.Data)
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
 }
 
 // AppendFrame appends a marshaled form of the frame to the provided buffer.

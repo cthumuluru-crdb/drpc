@@ -163,7 +163,8 @@ func TestMuxWriter_WriteErrorCallsOnError(t *testing.T) {
 	gotErr := make(chan error, 1)
 	mw := NewMuxWriter(fw, func(err error) { gotErr <- err })
 
-	assert.NoError(t, mw.WriteFrame(RandFrame()))
+	// Done=true triggers an explicit bw.Flush(), which hits the failWriter.
+	assert.NoError(t, mw.WriteFrame(Frame{Data: RandBytes(10), ID: RandID(), Kind: KindMessage, Done: true}))
 
 	select {
 	case err := <-gotErr:
@@ -191,7 +192,8 @@ func TestMuxWriter_OnErrorCallingStopDoesNotDeadlock(t *testing.T) {
 		mw.Stop(errors.New("stopped"))
 	})
 
-	assert.NoError(t, mw.WriteFrame(RandFrame()))
+	// Done=true triggers an explicit bw.Flush(), which hits the failWriter.
+	assert.NoError(t, mw.WriteFrame(Frame{Data: RandBytes(10), ID: RandID(), Kind: KindMessage, Done: true}))
 
 	select {
 	case <-mw.Done():
@@ -206,7 +208,8 @@ func TestMuxWriter_BlockedWriteUnblockedByClose(t *testing.T) {
 	bw := newBlockingWriter()
 	mw := NewMuxWriter(bw, func(error) {})
 
-	assert.NoError(t, mw.WriteFrame(RandFrame()))
+	// Done=true triggers an explicit bw.Flush(), causing run() to call Write on bw.
+	assert.NoError(t, mw.WriteFrame(Frame{Data: RandBytes(10), ID: RandID(), Kind: KindMessage, Done: true}))
 
 	// Wait for run() to enter Write.
 	select {
@@ -256,8 +259,10 @@ func TestMuxWriter_StopDiscardsBufferedData(t *testing.T) {
 	bw := newBlockingWriter()
 	mw := NewMuxWriter(bw, func(error) {})
 
-	// Write several frames while the writer is blocked on the first Write.
-	for range 10 {
+	// Write several frames. The first has Done=true to guarantee bw.Flush() fires
+	// and run() enters Write on the blockingWriter.
+	assert.NoError(t, mw.WriteFrame(Frame{Data: RandBytes(10), ID: RandID(), Kind: KindMessage, Done: true}))
+	for range 9 {
 		assert.NoError(t, mw.WriteFrame(RandFrame()))
 	}
 
