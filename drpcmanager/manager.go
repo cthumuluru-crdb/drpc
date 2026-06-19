@@ -16,7 +16,6 @@ import (
 
 	"github.com/zeebo/errs"
 	grpcmetadata "google.golang.org/grpc/metadata"
-
 	"storj.io/drpc"
 	"storj.io/drpc/drpcdebug"
 	"storj.io/drpc/drpcmetadata"
@@ -225,7 +224,7 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 		ps = &pendingStream{pa: drpcwire.NewPacketAssembler()}
 		m.pendingStreams[fr.ID.Stream] = ps
 	}
-	pkt, packetReady, err := ps.pa.AppendFrame(fr)
+	pkt, _, packetReady, err := ps.pa.AppendFrame(fr)
 	if err != nil {
 		return err
 	}
@@ -262,7 +261,9 @@ func (m *Manager) handleInvokeFrame(fr drpcwire.Frame) error {
 //
 
 // newStream creates a stream value with the appropriate configuration for this manager.
-func (m *Manager) newStream(ctx context.Context, sid uint64, kind drpc.StreamKind, rpc string) (*drpcstream.Stream, error) {
+func (m *Manager) newStream(
+	ctx context.Context, sid uint64, kind drpc.StreamKind, rpc string,
+) (*drpcstream.Stream, error) {
 	opts := m.opts.Stream
 	drpcopts.SetStreamKind(&opts.Internal, kind)
 	drpcopts.SetStreamRPC(&opts.Internal, rpc)
@@ -336,7 +337,9 @@ func (m *Manager) Close() error {
 }
 
 // NewClientStream starts a stream on the managed transport for use by a client.
-func (m *Manager) NewClientStream(ctx context.Context, rpc string) (stream *drpcstream.Stream, err error) {
+func (m *Manager) NewClientStream(
+	ctx context.Context, rpc string,
+) (stream *drpcstream.Stream, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -346,7 +349,9 @@ func (m *Manager) NewClientStream(ctx context.Context, rpc string) (stream *drpc
 // NewServerStream starts a stream on the managed transport for use by a server.
 // It does this by waiting for the client to issue an invoke message and
 // returning the details.
-func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Stream, rpc string, err error) {
+func (m *Manager) NewServerStream(
+	ctx context.Context,
+) (stream *drpcstream.Stream, rpc string, err error) {
 	select {
 	case <-ctx.Done():
 		return nil, "", ctx.Err()

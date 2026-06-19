@@ -73,6 +73,33 @@ func (rb *ringBuffer) Enqueue(data []byte) {
 	rb.cond.Broadcast()
 }
 
+// EnqueueOwned places an already-pooled buffer into the next write slot without
+// copying, taking ownership of b. If the buffer is full, it blocks until a slot
+// is freed or the buffer is closed. If closed, b is returned to the pool.
+func (rb *ringBuffer) EnqueueOwned(b *[]byte) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+
+	for rb.count == len(rb.buf) && rb.err == nil {
+		rb.cond.Wait()
+	}
+	if rb.err != nil {
+		rb.pool.Put(b)
+		return
+	}
+
+	rb.buf[rb.head] = b
+	rb.head = (rb.head + 1) % len(rb.buf)
+	rb.count++
+	rb.cond.Broadcast()
+}
+
+// Release returns a pooled buffer to the pool. It is used for buffers that were
+// taken ownership of but not enqueued (e.g. control packets).
+func (rb *ringBuffer) Release(b *[]byte) {
+	rb.pool.Put(b)
+}
+
 // Dequeue returns the data from the next buffered message and advances the
 // tail. The returned slice is valid until Done is called, which releases the
 // underlying buffer back to the pool. Done must be called exactly once after

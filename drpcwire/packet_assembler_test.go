@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/zeebo/assert"
-
 	"storj.io/drpc"
 )
 
@@ -16,7 +15,7 @@ func TestPacketAssembler_WrongStreamID(t *testing.T) {
 	pa := NewPacketAssembler()
 	pa.SetStreamID(1)
 
-	_, _, err := pa.AppendFrame(Frame{
+	_, _, _, err := pa.AppendFrame(Frame{
 		ID:   ID{Stream: 2, Message: 1},
 		Kind: KindMessage,
 		Done: true,
@@ -30,7 +29,7 @@ func TestPacketAssembler_StreamIDInferredFromFirstFrame(t *testing.T) {
 	pa := NewPacketAssembler()
 
 	// First frame sets the stream ID implicitly.
-	_, _, err := pa.AppendFrame(Frame{
+	_, _, _, err := pa.AppendFrame(Frame{
 		ID:   ID{Stream: 5, Message: 1},
 		Kind: KindMessage,
 		Done: true,
@@ -38,7 +37,7 @@ func TestPacketAssembler_StreamIDInferredFromFirstFrame(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Second frame for a different stream is rejected.
-	_, _, err = pa.AppendFrame(Frame{
+	_, _, _, err = pa.AppendFrame(Frame{
 		ID:   ID{Stream: 6, Message: 2},
 		Kind: KindMessage,
 		Done: true,
@@ -53,13 +52,13 @@ func TestPacketAssembler_MessageMonotonicity(t *testing.T) {
 	pa.SetStreamID(1)
 
 	// m3 completes, next expected becomes 4.
-	_, _, err := pa.AppendFrame(Frame{
+	_, _, _, err := pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 3}, Kind: KindMessage, Done: true,
 	})
 	assert.NoError(t, err)
 
 	// m2 < 4 → error.
-	_, _, err = pa.AppendFrame(Frame{
+	_, _, _, err = pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 2}, Kind: KindMessage, Done: true,
 	})
 	assert.Error(t, err)
@@ -74,14 +73,14 @@ func TestPacketAssembler_HigherMsgDiscardsInProgress(t *testing.T) {
 	pa.SetStreamID(1)
 
 	// Start accumulating m1.
-	_, ready, err := pa.AppendFrame(Frame{
+	_, _, ready, err := pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Data: []byte("discard"), Done: false,
 	})
 	assert.NoError(t, err)
 	assert.That(t, !ready)
 
 	// m2 arrives, m1 data should be silently discarded.
-	pkt, ready, err := pa.AppendFrame(Frame{
+	pkt, _, ready, err := pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 2}, Kind: KindMessage, Data: []byte("kept"), Done: true,
 	})
 	assert.NoError(t, err)
@@ -95,12 +94,12 @@ func TestPacketAssembler_KindChangeWithinPacket(t *testing.T) {
 	pa := NewPacketAssembler()
 	pa.SetStreamID(1)
 
-	_, _, err := pa.AppendFrame(Frame{
+	_, _, _, err := pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Done: false,
 	})
 	assert.NoError(t, err)
 
-	_, _, err = pa.AppendFrame(Frame{
+	_, _, _, err = pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 1}, Kind: KindError, Done: true,
 	})
 	assert.Error(t, err)
@@ -113,19 +112,19 @@ func TestPacketAssembler_MultiFrameDataAccumulation(t *testing.T) {
 	pa := NewPacketAssembler()
 	pa.SetStreamID(1)
 
-	_, ready, err := pa.AppendFrame(Frame{
+	_, _, ready, err := pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Data: []byte("hel"), Done: false,
 	})
 	assert.NoError(t, err)
 	assert.That(t, !ready)
 
-	_, ready, err = pa.AppendFrame(Frame{
+	_, _, ready, err = pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Data: []byte("lo "), Done: false,
 	})
 	assert.NoError(t, err)
 	assert.That(t, !ready)
 
-	pkt, ready, err := pa.AppendFrame(Frame{
+	pkt, _, ready, err := pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Data: []byte("world"), Done: true,
 	})
 	assert.NoError(t, err)
@@ -141,19 +140,19 @@ func TestPacketAssembler_MultiFrameWithSkippedMessageID(t *testing.T) {
 	pa.SetStreamID(1)
 
 	// msg=3 is greater than initial expected message ID=1.
-	_, ready, err := pa.AppendFrame(Frame{
+	_, _, ready, err := pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 3}, Kind: KindMessage, Data: []byte("hel"), Done: false,
 	})
 	assert.NoError(t, err)
 	assert.That(t, !ready)
 
-	_, ready, err = pa.AppendFrame(Frame{
+	_, _, ready, err = pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 3}, Kind: KindMessage, Data: []byte("lo"), Done: false,
 	})
 	assert.NoError(t, err)
 	assert.That(t, !ready)
 
-	pkt, ready, err := pa.AppendFrame(Frame{
+	pkt, _, ready, err := pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 3}, Kind: KindMessage, Data: []byte(" world"), Done: true,
 	})
 	assert.NoError(t, err)
@@ -167,13 +166,13 @@ func TestPacketAssembler_DonePreventsReplay(t *testing.T) {
 	pa.SetStreamID(1)
 
 	// m1 completes → next expected becomes 2.
-	_, _, err := pa.AppendFrame(Frame{
+	_, _, _, err := pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Done: true,
 	})
 	assert.NoError(t, err)
 
 	// Same message ID again → error.
-	_, _, err = pa.AppendFrame(Frame{
+	_, _, _, err = pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Done: true,
 	})
 	assert.Error(t, err)
@@ -189,12 +188,12 @@ func TestPacketAssembler_KindChangeAcrossMessages(t *testing.T) {
 	pa.SetStreamID(1)
 
 	// Multi-frame message 1 with KindMessage.
-	_, _, err := pa.AppendFrame(Frame{
+	_, _, _, err := pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Data: []byte("ab"), Done: false,
 	})
 	assert.NoError(t, err)
 
-	pkt, ready, err := pa.AppendFrame(Frame{
+	pkt, _, ready, err := pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Data: []byte("cd"), Done: true,
 	})
 	assert.NoError(t, err)
@@ -202,7 +201,7 @@ func TestPacketAssembler_KindChangeAcrossMessages(t *testing.T) {
 	assert.DeepEqual(t, pkt.Data, []byte("abcd"))
 
 	// Message 2 with a different kind — should not trigger kind check.
-	pkt, ready, err = pa.AppendFrame(Frame{
+	pkt, _, ready, err = pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 2}, Kind: KindClose, Done: true,
 	})
 	assert.NoError(t, err)
@@ -216,7 +215,7 @@ func TestPacketAssembler_Reset(t *testing.T) {
 	pa.SetStreamID(1)
 
 	// Complete a packet on stream 1.
-	_, _, err := pa.AppendFrame(Frame{
+	_, _, _, err := pa.AppendFrame(Frame{
 		ID: ID{Stream: 1, Message: 1}, Kind: KindMessage, Done: true,
 	})
 	assert.NoError(t, err)
@@ -225,7 +224,7 @@ func TestPacketAssembler_Reset(t *testing.T) {
 	pa.Reset()
 
 	// A frame for stream 2 should now be accepted.
-	pkt, ready, err := pa.AppendFrame(Frame{
+	pkt, _, ready, err := pa.AppendFrame(Frame{
 		ID: ID{Stream: 2, Message: 1}, Kind: KindMessage, Data: []byte("new"), Done: true,
 	})
 	assert.NoError(t, err)

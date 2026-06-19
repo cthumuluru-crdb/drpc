@@ -33,8 +33,9 @@ type Options struct {
 
 // Conn is a drpc client connection.
 type Conn struct {
-	tr  drpc.Transport
-	man *drpcmanager.Manager
+	tr       drpc.Transport
+	man      *drpcmanager.Manager
+	sendPool *drpcstream.BufferPool
 }
 
 var _ drpc.Conn = (*Conn)(nil)
@@ -46,7 +47,8 @@ func New(tr drpc.Transport) *Conn { return NewWithOptions(tr, Options{}) }
 // The Options control details of how the conn operates.
 func NewWithOptions(tr drpc.Transport, opts Options) *Conn {
 	c := &Conn{
-		tr: tr,
+		tr:       tr,
+		sendPool: drpcstream.NewBufferPool(),
 	}
 
 	shouldWrap := opts.ShouldRecord != nil
@@ -80,7 +82,9 @@ func (c *Conn) Close() (err error) { return c.man.Close() }
 
 // Invoke issues the rpc on the transport serializing in, waits for a response, and
 // deserializes it into out.
-func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message) (err error) {
+func (c *Conn) Invoke(
+	ctx context.Context, rpc string, enc drpc.Encoding, in, out drpc.Message,
+) (err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 
 	var metadata []byte
@@ -95,11 +99,13 @@ func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, ou
 	}
 	defer func() { err = errs.Combine(err, stream.Close()) }()
 
-	// TODO: use buffer pool to reduce allocations
-	data, err := drpcenc.MarshalAppend(in, enc, nil)
+	buf := c.sendPool.Get()
+	defer c.sendPool.Put(buf)
+	*buf, err = drpcenc.MarshalAppend(in, enc, (*buf)[:0])
 	if err != nil {
 		return err
 	}
+	data := *buf
 
 	if err := c.doInvoke(stream, enc, rpc, data, metadata, out); err != nil {
 		return err
@@ -107,7 +113,14 @@ func (c *Conn) Invoke(ctx context.Context, rpc string, enc drpc.Encoding, in, ou
 	return nil
 }
 
-func (c *Conn) doInvoke(stream *drpcstream.Stream, enc drpc.Encoding, rpc string, data []byte, metadata []byte, out drpc.Message) (err error) {
+func (c *Conn) doInvoke(
+	stream *drpcstream.Stream,
+	enc drpc.Encoding,
+	rpc string,
+	data []byte,
+	metadata []byte,
+	out drpc.Message,
+) (err error) {
 	defer func() { err = stream.CheckCancelError(err) }()
 	if err := stream.WriteInvoke(rpc, metadata); err != nil {
 		return err
@@ -125,7 +138,9 @@ func (c *Conn) doInvoke(stream *drpcstream.Stream, enc drpc.Encoding, rpc string
 }
 
 // NewStream begins a streaming rpc on the connection.
-func (c *Conn) NewStream(ctx context.Context, rpc string, enc drpc.Encoding) (_ drpc.Stream, err error) {
+func (c *Conn) NewStream(
+	ctx context.Context, rpc string, enc drpc.Encoding,
+) (_ drpc.Stream, err error) {
 	defer func() { err = drpc.ToRPCErr(err) }()
 
 	var metadata []byte

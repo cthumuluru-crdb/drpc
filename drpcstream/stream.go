@@ -11,7 +11,6 @@ import (
 	"sync"
 
 	"github.com/zeebo/errs"
-
 	"storj.io/drpc"
 	"storj.io/drpc/drpcctx"
 	"storj.io/drpc/drpcdebug"
@@ -86,7 +85,9 @@ func New(ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, pool *BufferPo
 // stream id and will use the writer to write messages on. It is important use
 // monotonically increasing stream ids within a single transport. The options
 // are used to control details of how the Stream operates.
-func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, pool *BufferPool, opts Options) *Stream {
+func NewWithOptions(
+	ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, pool *BufferPool, opts Options,
+) *Stream {
 	var task *trace.Task
 	if trace.IsEnabled() {
 		kind, rpc := drpcopts.GetStreamKind(&opts.Internal), drpcopts.GetStreamRPC(&opts.Internal)
@@ -97,6 +98,7 @@ func NewWithOptions(ctx context.Context, sid uint64, wr *drpcwire.MuxWriter, poo
 
 	pa := drpcwire.NewPacketAssembler()
 	pa.SetStreamID(sid)
+	pa.SetPool(pool)
 
 	s := &Stream{
 		ctx: streamCtx{
@@ -206,27 +208,37 @@ func (s *Stream) HandleFrame(fr drpcwire.Frame) (err error) {
 		return nil
 	}
 
-	packet, packetReady, err := s.pa.AppendFrame(fr)
+	packet, owned, packetReady, err := s.pa.AppendFrame(fr)
 	if err != nil {
 		return err
 	}
 	if !packetReady {
 		return nil
 	}
-	return s.handlePacket(packet)
+	return s.handlePacket(packet, owned)
 }
 
 // handlePacket advances the stream state machine by inspecting the packet. It
 // returns any major errors that should terminate the transport the stream is
 // operating on.
-func (s *Stream) handlePacket(pkt drpcwire.Packet) (err error) {
+func (s *Stream) handlePacket(pkt drpcwire.Packet, owned *[]byte) (err error) {
 	drpcopts.GetStreamStats(&s.opts.Internal).AddRead(uint64(len(pkt.Data)))
 
 	s.log("HANDLE", pkt.String)
 
 	if pkt.Kind == drpcwire.KindMessage {
-		s.recvQueue.Enqueue(pkt.Data)
+		if owned != nil {
+			s.recvQueue.EnqueueOwned(owned)
+		} else {
+			s.recvQueue.Enqueue(pkt.Data)
+		}
 		return nil
+	}
+
+	// Control packets are consumed inline below; release the pooled buffer once
+	// we are done reading pkt.Data.
+	if owned != nil {
+		defer s.recvQueue.Release(owned)
 	}
 
 	s.mu.Lock()
