@@ -591,9 +591,7 @@ func TestManager_ServerClientHangupCancels(t *testing.T) {
 
 // TestManager_ConcurrentCloseAndNewClientStream exercises the race between
 // Manager.Close (terminate → stop writer, close transport, close streams) and
-// Manager.NewClientStream (newStream → create stream, add to streams, wg.Add).
-// Under -race this would fail without wg.Add being atomic with the closed
-// check in activeStreams.Add.
+// Manager.NewClientStream (newStream → create stream, add to streams).
 func TestManager_ConcurrentCloseAndNewClientStream(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		cconn, sconn := net.Pipe()

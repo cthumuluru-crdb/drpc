@@ -25,11 +25,8 @@ func newActiveStreams() *activeStreams {
 }
 
 // Add adds a stream. It returns an error if the collection is closed or if a
-// stream with the same ID already exists. If wg is non-nil, it is incremented
-// under the same lock that checks closed, so wg.Add and the closed check are
-// atomic with respect to Close (which sets closed before Manager.Close calls
-// wg.Wait).
-func (r *activeStreams) Add(id uint64, stream *drpcstream.Stream, wg *sync.WaitGroup) error {
+// stream with the same ID already exists.
+func (r *activeStreams) Add(id uint64, stream *drpcstream.Stream) error {
 	if stream == nil {
 		return managerClosed.New("stream can't be nil")
 	}
@@ -44,9 +41,6 @@ func (r *activeStreams) Add(id uint64, stream *drpcstream.Stream, wg *sync.WaitG
 		return managerClosed.New("duplicate stream id")
 	}
 	r.streams[id] = stream
-	if wg != nil {
-		wg.Add(1)
-	}
 	return nil
 }
 
@@ -73,17 +67,21 @@ func (r *activeStreams) Get(id uint64) (*drpcstream.Stream, bool) {
 	return s, ok
 }
 
-// Close cancels all active streams with the given error, clears the
-// collection, and marks it as closed to prevent future Add calls.
+// Close marks the collection closed (rejecting future Add calls),
+// snapshots and clears the map, and then cancels each stream outside
+// the mutex. Doing the Cancel work outside the lock keeps Add/Get/Remove
+// callers unblocked and avoids nesting activeStreams.mu around each
+// stream's own lock.
 func (r *activeStreams) Close(err error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	r.closed = true
 	r.closeErr = err
-	for id, s := range r.streams {
+	streams := r.streams
+	r.streams = nil
+	r.mu.Unlock()
+
+	for _, s := range streams {
 		s.Cancel(err)
-		delete(r.streams, id)
 	}
 }
 
